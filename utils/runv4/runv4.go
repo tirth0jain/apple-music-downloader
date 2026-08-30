@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"golang.org/x/sync/errgroup"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -278,6 +280,17 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 		return errors.New("non-byterange playlists are currently unsupported")
 	}
 
+	// If the playlist carries no EXT-X-KEY (Apple sometimes omits it from the
+	// web-API copy), fall back to the wrapper's OWN session playlist — the
+	// /key endpoint then returns the template for the right session key.
+	defaultKeyURI := ""
+	if !segmentsHaveKey(segments) {
+		defaultKeyURI = wrapperSessionKeyURI(Config.LiteServer, adamId)
+		if defaultKeyURI != "" {
+			fmt.Printf("playlist has no key line; using wrapper session key %s\n", defaultKeyURI)
+		}
+	}
+
 	// get URL to the actual file
 	parsedUrl, err := url.Parse(playlistUrl)
 	if err != nil {
@@ -392,7 +405,7 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 		totalLen = do.ContentLength
 	}
 
-	err = downloadAndDecryptFile(Config.LiteServer, body, outfile, adamId, segments, totalLen, Config)
+	err = downloadAndDecryptFile(Config.LiteServer, body, outfile, adamId, segments, totalLen, defaultKeyURI, Config)
 	if err != nil {
 		return err
 	}
@@ -402,7 +415,7 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 
 func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
 	adamId string, playlistSegments []*m3u8.MediaSegment, totalLen int64,
-	Config structs.ConfigSet) error {
+	defaultKeyURI string, Config structs.ConfigSet) error {
 	var buffer bytes.Buffer
 	var outBuf *bufio.Writer
 	MaxMemorySize := int64(Config.MaxMemoryLimit * 1024 * 1024)
@@ -590,7 +603,7 @@ func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
 	eg.Go(func() error {
 		defer close(jobs) // 读取完毕，关闭任务通道
 		seq := 0
-		curKey := ""
+		curKey := defaultKeyURI
 
 		for i := 0; ; i++ {
 			// 检查是否发生了全局错误，如果有则放弃读取
@@ -970,4 +983,69 @@ func DecryptFragment(frag *mp4.Fragment, tracks map[uint32]mp4.DecryptTrackInfo,
 	}
 
 	return allSamples, nil
+}
+
+// segmentsHaveKey - does any playlist segment carry an EXT-X-KEY uri?
+func segmentsHaveKey(segs []*m3u8.MediaSegment) bool {
+	for _, seg := range segs {
+		if seg != nil && seg.Key != nil && seg.Key.URI != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// wrapperSessionKeyURI - fetch the wrapper's own session playlist for the
+// adamId and return its (last) EXT-X-KEY uri, or "" on any failure.
+func wrapperSessionKeyURI(liteServer, adamId string) string {
+	if liteServer == "" {
+		return ""
+	}
+	endpoint := strings.TrimRight(liteServer, "/") + "/m3u8?adamId=" + url.QueryEscape(adamId)
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		resp, err := http.Get(endpoint)
+		if err == nil {
+			body, rerr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if rerr == nil {
+				var env struct {
+					Code int    `json:"code"`
+					Msg  string `json:"msg"`
+					Data struct {
+						M3u8 string `json:"m3u8"`
+					} `json:"data"`
+				}
+				if json.NewDecoder(bytes.NewReader(body)).Decode(&env) == nil && env.Code == 0 && env.Data.M3u8 != "" {
+					if uri := mediaPlaylistKeyURI(env.Data.M3u8); uri != "" {
+						return uri
+					}
+				}
+			}
+		} else {
+			lastErr = err
+		}
+		time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+	}
+	_ = lastErr
+	return ""
+}
+
+// mediaPlaylistKeyURI - fetch + parse an HLS media playlist, return the last
+// EXT-X-KEY uri found ("" if none / failure).
+func mediaPlaylistKeyURI(playlistURL string) string {
+	resp, err := http.Get(playlistURL)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	from, listType, err := m3u8.DecodeFrom(resp.Body, true)
+	if err != nil || listType != m3u8.MEDIA {
+		return ""
+	}
+	media := from.(*m3u8.MediaPlaylist)
+	if media.Key != nil && media.Key.URI != "" {
+		return strings.Split(media.Key.URI, ",")[0]
+	}
+	return ""
 }

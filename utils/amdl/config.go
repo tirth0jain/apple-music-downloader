@@ -135,5 +135,17 @@ func loadConfig() error {
 	}
 
 	runv5.WrapperToken = Config.LiteServerToken
+
+	// Env overrides so a wrapper script (rip.sh) can point each invocation
+	// at a per-rip output dir and the right lite-server (multi-account).
+	if v := os.Getenv("AMDL_SAVE_FOLDER"); v != "" {
+		Config.AlacSaveFolder = v
+	}
+	if v := os.Getenv("AMDL_LITE_SERVER"); v != "" {
+		Config.LiteServer = v
+	}
+	if v := os.Getenv("AMDL_STOREFRONT"); v != "" {
+		Config.Storefront = v
+	}
 	return nil
 }

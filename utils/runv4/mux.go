@@ -70,6 +70,23 @@ var alacEntryBody = []byte{
 // patchAudioParams - set channelcount, samplesize and samplerate in both the
 // entry fields and the ALAC magic cookie. The AudioSampleEntry samplerate is
 // 16.16 fixed-point (44100 << 16); the magic cookie stores it raw.
+// patchRateOnly - normalize just the two samplerate fields (entry 16.16
+// field + magic-cookie raw rate), leaving Apple's cookie bytes untouched.
+func patchRateOnly(body []byte, rate uint32) []byte {
+	out := make([]byte, len(body))
+	copy(out, body)
+	rateFixed := rate << 16
+	out[24] = byte(rateFixed >> 24)
+	out[25] = byte(rateFixed >> 16)
+	out[26] = byte(rateFixed >> 8)
+	out[27] = byte(rateFixed)
+	out[60] = byte(rate >> 24)
+	out[61] = byte(rate >> 16)
+	out[62] = byte(rate >> 8)
+	out[63] = byte(rate)
+	return out
+}
+
 func patchAudioParams(body []byte, channels uint16, sampleSize uint16, rate uint32) []byte {
 	out := make([]byte, len(body))
 	copy(out, body)
@@ -77,6 +94,8 @@ func patchAudioParams(body []byte, channels uint16, sampleSize uint16, rate uint
 	out[17] = byte(channels)
 	out[18] = byte(sampleSize >> 8)
 	out[19] = byte(sampleSize)
+	// magic-cookie bitDepth byte (body[45] = entry[53])
+	out[45] = byte(sampleSize)
 	rateFixed := rate << 16
 	out[24] = byte(rateFixed >> 24)
 	out[25] = byte(rateFixed >> 16)
@@ -101,6 +120,7 @@ func MuxStandardM4A(init *mp4.InitSegment, samples []mp4.FullSample, w io.Writer
 	stsd := trak.Mdia.Minf.Stbl.Stsd
 	channels, sampleSize := uint16(2), uint16(24)
 	sampleRate := uint32(44100)
+	var srcEntry []byte // the source's own alac sample entry (with Apple's cookie)
 	if len(stsd.Children) > 0 {
 		var buf bytes.Buffer
 		_ = stsd.Children[0].Encode(&buf)
@@ -109,6 +129,9 @@ func MuxStandardM4A(init *mp4.InitSegment, samples []mp4.FullSample, w io.Writer
 			channels = binary.BigEndian.Uint16(b[24:26])
 			sampleSize = binary.BigEndian.Uint16(b[26:28])
 			sampleRate = binary.BigEndian.Uint32(b[32:36]) >> 16
+		}
+		if len(b) >= 72 && string(b[4:8]) == "alac" {
+			srcEntry = b
 		}
 	}
 	if sampleRate == 0 {
@@ -138,8 +161,18 @@ func MuxStandardM4A(init *mp4.InitSegment, samples []mp4.FullSample, w io.Writer
 	stbl := track.Mdia.Minf.Stbl
 	stsdOut := stbl.Stsd
 	stsdOut.SampleCount = 1
+	var entryBody []byte
+	if srcEntry != nil {
+		// Use Apple's OWN sample entry verbatim except the samplerate fields:
+		// its magic cookie is authoritative for bit depth / channels /
+		// maxRun / maxFrameBytes (the entry's samplesize field lies — 16 for
+		// both 16- and 24-bit tracks).
+		entryBody = patchRateOnly(srcEntry[8:], sampleRate)
+	} else {
+		entryBody = patchAudioParams(alacEntryBody, channels, sampleSize, sampleRate)
+	}
 	stsdOut.Children = []mp4.Box{
-		&fixedBox{typ: "alac", payload: patchAudioParams(alacEntryBody, channels, sampleSize, sampleRate)},
+		&fixedBox{typ: "alac", payload: entryBody},
 	}
 
 	stts := &mp4.SttsBox{}
@@ -179,7 +212,10 @@ func MuxStandardM4A(init *mp4.InitSegment, samples []mp4.FullSample, w io.Writer
 	if err := moov.Encode(&moovBuf); err != nil {
 		return err
 	}
-	mdatPayload := uint32(init.Ftyp.Size() + uint64(moovBuf.Len()) + 8)
+	// ftyp: standard M4A brands (the source init's "iso5" brand makes the
+	// fork's tagger refuse the file: "unsupported ftyp: 69736f35")
+	ftyp := mp4.NewFtyp("M4A ", 0, []string{"isom", "iso2", "mp41"})
+	mdatPayload := uint32(ftyp.Size() + uint64(moovBuf.Len()) + 8)
 	stco.ChunkOffset[0] = mdatPayload
 
 	moovBuf.Reset()
@@ -187,7 +223,7 @@ func MuxStandardM4A(init *mp4.InitSegment, samples []mp4.FullSample, w io.Writer
 		return err
 	}
 
-	if err := init.Ftyp.Encode(w); err != nil {
+	if err := ftyp.Encode(w); err != nil {
 		return err
 	}
 	if _, err := w.Write(moovBuf.Bytes()); err != nil {
