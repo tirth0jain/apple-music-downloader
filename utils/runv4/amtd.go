@@ -35,10 +35,17 @@ type liteResponse struct {
 	Data templateResponse `json:"data"`
 }
 
-func fetchTemplate(baseURL, adam, uri string) (*template, error) {
+func fetchTemplate(baseURL, adam, uri, token string) (*template, error) {
 	endpoint := strings.TrimRight(baseURL, "/") + "/key?adamId=" + url.QueryEscape(adam) + "&uri=" + url.QueryEscape(uri)
 	client := http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(endpoint)
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}

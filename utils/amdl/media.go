@@ -315,7 +315,14 @@ func checkM3u8(b string, f string) (string, error) {
 		return "", errors.New("lite-server is not configured")
 	}
 	endpoint := strings.TrimRight(Config.LiteServer, "/") + "/m3u8?adamId=" + url.QueryEscape(b)
-	resp, err := http.Get(endpoint)
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	if Config.LiteServerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+Config.LiteServerToken)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fmt.Println("Error connecting to lite-server:", err)
 		return "", err

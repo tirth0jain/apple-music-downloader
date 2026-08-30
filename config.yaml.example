@@ -23,6 +23,10 @@ max-memory-limit: 256 # MB
 # example: lite-server: "http://127.0.0.1:8080"
 lite-server: "http://127.0.0.1:8080"
 
+# optional bearer token for the lite-server HTTP API (Authorization: Bearer).
+# needed when the wrapper gates its API (e.g. our wrapper-v2 v3-auth WRAPPER_TOKEN)
+lite-server-token: ""
+
 # set to 'true' to exit on error instead of requiring manual intervention. (for using this program in scripts)
 exit-on-error: false
 

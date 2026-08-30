@@ -34,7 +34,7 @@ type TimedResponseBody struct {
 type decryptJob struct {
 	Seq       int           // 分片序号，用于重组
 	Frag      *mp4.Fragment // 原始分片
-	Tmpl      *template     // 密钥模板
+	KeyURI    string        // 该分片加密使用的 EXT-X-KEY URI
 	RawOffset int64
 }
 
@@ -43,6 +43,7 @@ type decryptResult struct {
 	Seq       int
 	Frag      *mp4.Fragment
 	RawOffset int64
+	Samples   []mp4.FullSample
 }
 
 func (b *TimedResponseBody) Read(p []byte) (int, error) {
@@ -60,7 +61,111 @@ func (b *TimedResponseBody) Read(p []byte) (int, error) {
 const (
 	downloadMaxAttempts = 5                // 最多尝试次数
 	downloadIdleTimeout = 30 * time.Second // 30 秒没收到任何字节就认为卡死
+
+	// parallelRangeWorkers - concurrent byte-range fetches for Apple's
+	// single-file HLS layout (the CDN caps a single connection at ~2.5MB/s
+	// but serves ~60MB/s aggregate across 19 parallel ranges).
+	parallelRangeWorkers = 12
 )
+
+// fetchRange - fetch one byte range (Retry with backoff).
+func fetchRange(ctx context.Context, client *http.Client, fileUrl string, off, length int64, f *os.File) error {
+	for attempt := 1; attempt <= downloadMaxAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, "GET", fileUrl, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, off+length-1))
+		resp, err := client.Do(req)
+		if err == nil {
+			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent {
+				data, rerr := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if rerr == nil && int64(len(data)) == length {
+					_, werr := f.WriteAt(data, off)
+					if werr != nil {
+						return werr
+					}
+					return nil
+				}
+				if rerr == nil {
+					err = fmt.Errorf("short range at %d: got %d of %d bytes", off, len(data), length)
+				} else {
+					err = rerr
+				}
+			} else {
+				err = fmt.Errorf("range at %d: server returned %s", off, resp.Status)
+				resp.Body.Close()
+			}
+		}
+		if attempt < downloadMaxAttempts {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt) * 250 * time.Millisecond):
+			}
+		}
+	}
+	return fmt.Errorf("range at %d failed after %d attempts", off, downloadMaxAttempts)
+}
+
+// downloadParallelRanges - fetch all byte-range segments (and the init
+// prefix) concurrently into the preallocated file.
+func downloadParallelRanges(ctx context.Context, client *http.Client, fileUrl string,
+	segments []*m3u8.MediaSegment, f *os.File, totalLen int64) error {
+
+	type rng struct{ off, length int64 }
+	ranges := []rng{{0, segments[0].Offset}} // init = bytes before first segment
+	sawRange := false
+	for _, seg := range segments {
+		if seg == nil {
+			continue
+		}
+		if seg.Limit <= 0 || seg.Offset <= 0 {
+			continue
+		}
+		ranges = append(ranges, rng{seg.Offset, seg.Limit})
+		sawRange = true
+	}
+	if !sawRange {
+		return errors.New("no byte ranges found in playlist")
+	}
+	if err := f.Truncate(totalLen); err != nil {
+		return err
+	}
+
+	jobs := make(chan rng, len(ranges))
+	for _, r := range ranges {
+		jobs <- r
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(ranges))
+	for i := 0; i < parallelRangeWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for r := range jobs {
+				if err := fetchRange(ctx, client, fileUrl, r.off, r.length, f); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // downloadWithResume 下载完整文件到内存，支持断点续传、空闲超时和重试。
 // 只有拿到 totalLen 字节才返回成功。
@@ -186,68 +291,106 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 	// request mp4
 	ctx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
-	req, err = http.NewRequestWithContext(ctx, "GET", fileUrl.String(), nil)
-	if err != nil {
-		return err
-	}
-	req.Header = header
+	client := &http.Client{Timeout: timeout}
 
 	var body io.Reader
-	client := &http.Client{Timeout: timeout}
-	if optstimeout > 0 {
-		// create the timer before calling Do so that the timeout covers TCP handshake,
-		// TLS handshake, sending the request and receiving HTTP headers
-		timer := time.AfterFunc(timeout, func() { cancel(ErrTimeout) })
-		do, err = client.Do(req)
-		if err != nil {
-			return err
-		}
-		defer do.Body.Close()
-		body = &TimedResponseBody{
-			timeout:   timeout,
-			timer:     timer,
-			threshold: 256,
-			body:      do.Body,
-		}
-	} else {
-		do, err = client.Do(req)
-		if err != nil {
-			return err
-		}
-		defer do.Body.Close()
-		if do.ContentLength < int64(Config.MaxMemoryLimit*1024*1024) {
-			bar := progressbar.NewOptions64(
-				do.ContentLength,
-				progressbar.OptionClearOnFinish(),
-				progressbar.OptionSetElapsedTime(false),
-				progressbar.OptionSetPredictTime(false),
-				progressbar.OptionShowElapsedTimeOnFinish(),
-				progressbar.OptionShowCount(),
-				progressbar.OptionEnableColorCodes(true),
-				progressbar.OptionShowBytes(true),
-				progressbar.OptionSetDescription("Downloading..."),
-				progressbar.OptionSetTheme(progressbar.Theme{
-					Saucer:        "",
-					SaucerHead:    "",
-					SaucerPadding: "",
-					BarStart:      "",
-					BarEnd:        "",
-				}),
-			)
-			buffer, err := downloadWithResume(ctx, client, fileUrl.String(), header, do.ContentLength, bar)
-			if err != nil {
-				return err // 下载没完成就失败退出，绝不进入解密
-			}
-
-			body = buffer
-			fmt.Print("Downloaded\n")
-		} else {
-			body = do.Body
-		}
-	}
-
 	var totalLen int64
-	totalLen = do.ContentLength
+
+	if segment.Limit > 0 {
+		// Apple single-file byte-range HLS: fetch every range concurrently
+		// into a temp file, then decrypt+mux from it. This is the fast path
+		// (parallel connections smash the ~2.5MB/s single-connection cap).
+		totalLen = segment.Offset
+		for _, seg := range segments {
+			if seg == nil {
+				continue
+			}
+			if seg.Limit > 0 && seg.Offset > 0 {
+				end := seg.Offset + seg.Limit
+				if end > totalLen {
+					totalLen = end
+				}
+			}
+		}
+		tmpDir := os.Getenv("AMDL_TMPDIR")
+		if tmpDir == "" {
+			tmpDir = os.TempDir()
+		}
+		tmp, err := os.CreateTemp(tmpDir, "amdl-*.mp4")
+		if err != nil {
+			return err
+		}
+		defer tmp.Close()
+		defer os.Remove(tmp.Name())
+		if err := downloadParallelRanges(ctx, client, fileUrl.String(), segments, tmp, totalLen); err != nil {
+			return err
+		}
+		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		body = tmp
+		fmt.Printf("Downloaded (parallel byte ranges)\n")
+	} else {
+		req, err := http.NewRequestWithContext(ctx, "GET", fileUrl.String(), nil)
+		if err != nil {
+			return err
+		}
+		req.Header = make(http.Header)
+
+		var do *http.Response
+		if optstimeout > 0 {
+			// create the timer before calling Do so that the timeout covers TCP handshake,
+			// TLS handshake, sending the request and receiving HTTP headers
+			timer := time.AfterFunc(timeout, func() { cancel(ErrTimeout) })
+			do, err = client.Do(req)
+			if err != nil {
+				return err
+			}
+			defer do.Body.Close()
+			body = &TimedResponseBody{
+				timeout:   timeout,
+				timer:     timer,
+				threshold: 256,
+				body:      do.Body,
+			}
+		} else {
+			do, err = client.Do(req)
+			if err != nil {
+				return err
+			}
+			defer do.Body.Close()
+			if do.ContentLength < int64(Config.MaxMemoryLimit*1024*1024) {
+				bar := progressbar.NewOptions64(
+					do.ContentLength,
+					progressbar.OptionClearOnFinish(),
+					progressbar.OptionSetElapsedTime(false),
+					progressbar.OptionSetPredictTime(false),
+					progressbar.OptionShowElapsedTimeOnFinish(),
+					progressbar.OptionShowCount(),
+					progressbar.OptionEnableColorCodes(true),
+					progressbar.OptionShowBytes(true),
+					progressbar.OptionSetDescription("Downloading..."),
+					progressbar.OptionSetTheme(progressbar.Theme{
+						Saucer:        "",
+						SaucerHead:    "",
+						SaucerPadding: "",
+						BarStart:      "",
+						BarEnd:        "",
+					}),
+				)
+				buffer, err := downloadWithResume(ctx, client, fileUrl.String(), req.Header, do.ContentLength, bar)
+				if err != nil {
+					return err // 下载没完成就失败退出，绝不进入解密
+				}
+
+				body = buffer
+				fmt.Print("Downloaded\n")
+			} else {
+				body = do.Body
+			}
+		}
+		totalLen = do.ContentLength
+	}
 
 	err = downloadAndDecryptFile(Config.LiteServer, body, outfile, adamId, segments, totalLen, Config)
 	if err != nil {
@@ -258,7 +401,8 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 }
 
 func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
-	adamId string, playlistSegments []*m3u8.MediaSegment, totalLen int64, Config structs.ConfigSet) error {
+	adamId string, playlistSegments []*m3u8.MediaSegment, totalLen int64,
+	Config structs.ConfigSet) error {
 	var buffer bytes.Buffer
 	var outBuf *bufio.Writer
 	MaxMemorySize := int64(Config.MaxMemoryLimit * 1024 * 1024)
@@ -281,19 +425,50 @@ func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
 		return errors.New("no init segment found")
 	}
 
-	tracks, err := TransformInit(init)
+	// DecryptInit mutates the init (strips sinf/pssh) — call it exactly once
+	// and derive the track map from that single result.
+	di, err := mp4.DecryptInit(init)
 	if err != nil {
 		return err
+	}
+	tracks := make(map[uint32]mp4.DecryptTrackInfo, len(di.TrackInfos))
+	for _, ti := range di.TrackInfos {
+		// tracks map: prefer the TrackInfo that carries a trex
+		if prev, ok := tracks[ti.TrackID]; !ok || prev.Trex == nil {
+			tracks[ti.TrackID] = ti
+		}
 	}
 	err = sanitizeInit(init)
 	if err != nil {
 		// errors returned by sanitizeInit are non-fatal
 		fmt.Printf("Warning: unable to sanitize init completely: %s\n", err)
 	}
-	err = init.Encode(outBuf)
-	if err != nil {
-		return err
+
+	// Decrypt templates per key uri, cached (thread-safe). s1/e1 uses the
+	// built-in prefetch template; other uris are fetched from wrapper-lite
+	// /key (ctx/state/regs) lazily on first use.
+	var tmplMu sync.Mutex
+	tmplCache := map[string]*template{}
+	templateFor := func(uri string) (*template, error) {
+		if uri == prefetchKey || uri == "" {
+			return prefetchTemplate(), nil
+		}
+		tmplMu.Lock()
+		defer tmplMu.Unlock()
+		if t, ok := tmplCache[uri]; ok {
+			return t, nil
+		}
+		t, err := fetchTemplate(liteServer, adamId, uri, Config.LiteServerToken)
+		if err != nil {
+			return nil, err
+		}
+		tmplCache[uri] = t
+		return t, nil
 	}
+
+	// Output is a standard m4a (moov-first, full sample tables) assembled
+	// from the decrypted fragments AFTER decryption completes. Apple's fMP4
+	// layout is not standalone-decodable by ffmpeg, so we re-mux it.
 
 	// 'segment' in m3u8 == 'fragment' in mp4ff
 	//fmt.Println("Starting decryption...")
@@ -324,11 +499,12 @@ func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
 	jobs := make(chan *decryptJob, 10)
 	results := make(chan *decryptResult, 10)
 
-	// 2. 启动 Writer (按序重组并写入)
+	// 2. 启动 Writer (按序收集解密后的 samples，最后统一 re-mux 成标准 m4a)
 	eg.Go(func() error {
 		// 乱序重组缓冲区 (Reassembly Buffer)
 		buffer := make(map[int]*decryptResult)
 		expectedSeq := 0 // 期待写入的下一个序号
+		var samples []mp4.FullSample
 
 		for {
 			select {
@@ -336,8 +512,8 @@ func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
 				return ctx.Err()
 			case res, ok := <-results:
 				if !ok {
-					// results 通道已关闭，说明所有解密完成，且全部写入完毕
-					return nil
+					// results 通道已关闭，说明所有解密完成；re-mux 并写出
+					return muxFragments(init, samples, outBuf)
 				}
 
 				// 将乱序到达的结果放入缓冲区
@@ -346,10 +522,7 @@ func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
 				// 检查当前期望的序号是否已经准备好，准备好就一直往前推进
 				for {
 					if readyRes, exists := buffer[expectedSeq]; exists {
-						// 编码写入
-						if err := readyRes.Frag.Encode(outBuf); err != nil {
-							return fmt.Errorf("encode fragment seq %d failed: %w", expectedSeq, err)
-						}
+						samples = append(samples, readyRes.Samples...)
 						bar.Add64(readyRes.RawOffset)
 
 						// 清理内存并期待下一个
@@ -378,17 +551,25 @@ func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
 					if !ok {
 						return nil // 任务分发完毕，Worker 下班
 					}
-					// 核心解密逻辑
-					if err := DecryptFragment(job.Frag, tracks, job.Tmpl); err != nil {
-						return fmt.Errorf("decryptFragment seq %d: %w", job.Seq, err)
+					// 核心解密：wrapper-lite /key 提供每个 key uri 的模板
+					// (ctx/state/regs) — s1/e1 用内置 prefetch template，其余
+					// 惰性获取并缓存。samples 指向已解密的内存。
+					tmpl, err := templateFor(job.KeyURI)
+					if err != nil {
+						return fmt.Errorf("template seq %d: %w", job.Seq, err)
+					}
+					samples, err := DecryptFragment(job.Frag, tracks, tmpl)
+					if err != nil {
+						return fmt.Errorf("tmpl decrypt seq %d: %w", job.Seq, err)
 					}
 
-					// 提交解密结果
+					// 提交解密结果（samples 指向已解密的内存）
 					select {
 					case results <- &decryptResult{
 						Seq:       job.Seq,
 						Frag:      job.Frag,
 						RawOffset: job.RawOffset,
+						Samples:   samples,
 					}:
 					case <-ctx.Done():
 						return ctx.Err()
@@ -409,7 +590,7 @@ func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
 	eg.Go(func() error {
 		defer close(jobs) // 读取完毕，关闭任务通道
 		seq := 0
-		var tmpl *template
+		curKey := ""
 
 		for i := 0; ; i++ {
 			// 检查是否发生了全局错误，如果有则放弃读取
@@ -428,29 +609,18 @@ func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
 				break // 读到文件末尾
 			}
 
-			segment := playlistSegments[i]
-			if segment == nil {
-				return errors.New("segment number out of sync")
-			}
-
-			key := segment.Key
-			if key != nil && (i < 2) {
-				if key.URI == prefetchKey {
-					// 预取模板是写死的，直接使用，省去一次 /key 请求
-					tmpl = prefetchTemplate()
-				} else {
-					tmpl, err = fetchTemplate(liteServer, adamId, key.URI)
-				}
-				if err != nil {
-					return err
-				}
+			// 该 fragment 的加密 key uri（继承当前 EXT-X-KEY 状态：grafov 只在
+			// key 行之后的第一个 segment 上挂 Key，后续 segment 需继承）
+			if i < len(playlistSegments) && playlistSegments[i] != nil &&
+				playlistSegments[i].Key != nil && playlistSegments[i].Key.URI != "" {
+				curKey = playlistSegments[i].Key.URI
 			}
 
 			// 将任务发送给 Workers
 			job := &decryptJob{
 				Seq:       seq,
 				Frag:      frag,
-				Tmpl:      tmpl,
+				KeyURI:    curKey,
 				RawOffset: int64(rawoffset),
 			}
 
@@ -638,6 +808,18 @@ func FilterSbgpSgpd(children []mp4.Box) ([]mp4.Box, uint64) {
 	return remainingChildren, bytesRemoved
 }
 
+// requestContentKey - acquire the track's content key via lite-server
+// muxFragments - write a standard m4a from the ordered decrypted samples.
+func muxFragments(init *mp4.InitSegment, samples []mp4.FullSample, w *bufio.Writer) error {
+	if len(samples) == 0 {
+		return errors.New("no samples to mux")
+	}
+	if err := MuxStandardM4A(init, samples, w); err != nil {
+		return err
+	}
+	return nil
+}
+
 // Get decryption info for tracks from init segment and remove encryption-related boxes
 func TransformInit(init *mp4.InitSegment) (map[uint32]mp4.DecryptTrackInfo, error) {
 	di, err := mp4.DecryptInit(init)
@@ -722,14 +904,16 @@ func cbcsDecryptSamples(samples []mp4.FullSample, tmpl *template,
 	return nil
 }
 
-func DecryptFragment(frag *mp4.Fragment, tracks map[uint32]mp4.DecryptTrackInfo, tmpl *template) error {
+// Decrypt a cbcs-encrypted sample in-place
+func DecryptFragment(frag *mp4.Fragment, tracks map[uint32]mp4.DecryptTrackInfo, tmpl *template) ([]mp4.FullSample, error) {
 	moof := frag.Moof
 	var bytesRemoved uint64 = 0
+	var allSamples []mp4.FullSample
 
 	for _, traf := range moof.Trafs {
 		ti, ok := tracks[traf.Tfhd.TrackID]
 		if !ok {
-			return fmt.Errorf("could not find decryption info for track %d", traf.Tfhd.TrackID)
+			return nil, fmt.Errorf("could not find decryption info for track %d", traf.Tfhd.TrackID)
 		}
 		if ti.Sinf == nil {
 			// unencrypted track
@@ -738,11 +922,11 @@ func DecryptFragment(frag *mp4.Fragment, tracks map[uint32]mp4.DecryptTrackInfo,
 
 		schemeType := ti.Sinf.Schm.SchemeType
 		if schemeType != "cbcs" {
-			return fmt.Errorf("scheme type %s not supported", schemeType)
+			return nil, fmt.Errorf("scheme type %s not supported", schemeType)
 		}
 		hasSenc, isParsed := traf.ContainsSencBox()
 		if !hasSenc {
-			return fmt.Errorf("no senc box in traf")
+			return nil, fmt.Errorf("no senc box in traf")
 		}
 
 		var senc *mp4.SencBox
@@ -760,20 +944,21 @@ func DecryptFragment(frag *mp4.Fragment, tracks map[uint32]mp4.DecryptTrackInfo,
 			// (ref: https://dashif.org/docs/DASH-IF-IOP-v3.2.pdf)
 			err := senc.ParseReadBox(ti.Sinf.Schi.Tenc.DefaultPerSampleIVSize, traf.Saiz)
 			if err != nil {
-				return err
+				return nil, err
 			}
 		}
 
 		samples, err := frag.GetFullSamples(ti.Trex)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		err = cbcsDecryptSamples(samples, tmpl, ti.Sinf.Schi.Tenc, senc)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
+		allSamples = append(allSamples, samples...)
 		bytesRemoved += traf.RemoveEncryptionBoxes()
 	}
 	_, psshBytesRemoved := moof.RemovePsshs()
@@ -784,5 +969,5 @@ func DecryptFragment(frag *mp4.Fragment, tracks map[uint32]mp4.DecryptTrackInfo,
 		}
 	}
 
-	return nil
+	return allSamples, nil
 }

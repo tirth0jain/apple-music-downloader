@@ -248,9 +248,11 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	tagsString := strings.Join(tags, ":")
 	cmd := exec.Command("MP4Box", "-itags", tagsString, trackPath)
 	if err := cmd.Run(); err != nil {
-		fmt.Printf("Embed failed: %v\n", err)
-		counter.Error++
-		return
+		// MP4Box is OPTIONAL here: it only adds ilst tags to the intermediate
+		// m4a. Our seedbox pipeline re-encodes to FLAC and re-tags with
+		// metaflac (rip.sh), so a missing/unusable MP4Box must not fail the
+		// track — keep the downloaded file and continue.
+		fmt.Printf("Embed skipped (MP4Box unavailable or failed): %v\n", err)
 	}
 	if (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
 		if err := os.Remove(track.CoverPath); err != nil {

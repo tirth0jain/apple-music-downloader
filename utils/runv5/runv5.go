@@ -20,6 +20,7 @@ import (
 
 	"github.com/itouakirai/mp4ff/mp4"
 
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -32,6 +33,11 @@ import (
 
 	"main/utils/httputil"
 )
+
+// WrapperToken is an optional bearer token sent as "Authorization: Bearer"
+// on lite-server HTTP calls. Our wrapper-v2 (v3-auth) gates /webplayback,
+// /license and /status with WRAPPER_TOKEN; upstream wrapper-lite has no auth.
+var WrapperToken string
 
 // PlaybackLicense 是 wrapper-lite /license 接口的响应结构。
 // runv3 中对应的是 Apple acquireWebPlaybackLicense 的响应结构，
@@ -86,10 +92,13 @@ func BeforeRequest(cl *resty.Client, ctx context.Context, url string, body []byt
 		"adamId":    ctx.Value("adamId").(string),
 	}
 
-	resp, err := cl.R().
+	r := cl.R().
 		SetContext(ctx).
-		SetBody(jsondata).
-		Post(url)
+		SetBody(jsondata)
+	if WrapperToken != "" {
+		r.SetHeader("Authorization", "Bearer "+WrapperToken)
+	}
+	resp, err := r.Post(url)
 
 	if err != nil {
 		fmt.Println(err)
@@ -167,6 +176,9 @@ func GetWebplayback(adamId string, liteServer string, mvmode bool) (string, stri
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
 		return "", "", "", err
+	}
+	if WrapperToken != "" {
+		req.Header.Set("Authorization", "Bearer "+WrapperToken)
 	}
 	resp, err := httputil.Client.Do(req)
 	if err != nil {
@@ -394,6 +406,163 @@ func extsong(b string) bytes.Buffer {
 // Run 与 runv3.Run 签名一致，调用方可以无缝切换。authtoken / mutoken 不再使用，
 // liteServerUrl 为 wrapper-lite 地址（如 "http://127.0.0.1:8080"），
 // license 会发到 liteServerUrl + "/license"，webplayback 走 liteServerUrl + "/webplayback"。
+// RequestLicenseKey - full license exchange against lite-server /license:
+// builds the Widevine PSSH from the KID, sends the CDM challenge and
+// extracts the content key from the license response. This is the same flow
+// runv5.Run uses, exported so runv4 (ALAC) can share it.
+func RequestLicenseKey(liteServerUrl, adamId, uriPrefix, kidBase64 string) ([]byte, error) {
+	if kidBase64 == "" {
+		// wrapper keys on adamId + uri; pass an empty-kid challenge like
+		// the fork's aac-lc path does
+		kidBase64 = ""
+	}
+	ctx := context.Background()
+	ctx = context.WithValue(ctx, "pssh", kidBase64)
+	ctx = context.WithValue(ctx, "adamId", adamId)
+	ctx = context.WithValue(ctx, "uriPrefix", uriPrefix)
+	pssh, err := getPSSH("", kidBase64)
+	if err != nil {
+		return nil, err
+	}
+	client := resty.New()
+	k := key.Key{
+		ReqCli:        client,
+		BeforeRequest: BeforeRequest,
+		AfterRequest:  AfterRequest,
+	}
+	k.CdmInit()
+	_, keybt, err := k.GetKey(ctx, strings.TrimRight(liteServerUrl, "/")+"/license", pssh, nil)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Printf("AMDL-KEY %s\n", hex.EncodeToString(keybt))
+	return keybt, nil
+}
+
+// GetVariant - fetch the wrapper-issued master playlist and return the media
+// playlist URL for the requested codec variant (e.g. "alac"), the underlying
+// file URL (single-file byte-range HLS), the key URI and an empty KID
+// (wrapper keys on adamId + uri). Using the wrapper's own playlist keeps
+// download and license in the same playback session.
+func GetVariant(adamId, liteServer, codecSub string) (mediaURL, fileURL, keyURI, kidBase64 string, err error) {
+	if liteServer == "" {
+		return "", "", "", "", errors.New("lite-server is not configured")
+	}
+	endpoint := strings.TrimRight(liteServer, "/") + "/webplayback?adamId=" + url.QueryEscape(adamId)
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	if WrapperToken != "" {
+		req.Header.Set("Authorization", "Bearer "+WrapperToken)
+	}
+	resp, err := httputil.Client.Do(req)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", "", "", fmt.Errorf("lite-server /webplayback returned %s", resp.Status)
+	}
+	var envelope struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			M3u8 string `json:"m3u8"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		return "", "", "", "", err
+	}
+	if envelope.Code != 0 {
+		return "", "", "", "", fmt.Errorf("lite-server /webplayback returned code=%d msg=%s", envelope.Code, envelope.Msg)
+	}
+	masterURL := envelope.Data.M3u8
+	masterBody, err := getURLWithHeaders(masterURL, "", "")
+	if err != nil {
+		return "", "", "", "", err
+	}
+	from, listType, err := m3u8.DecodeFrom(strings.NewReader(string(masterBody)), true)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	if listType == m3u8.MEDIA {
+		// wrapper already returned a media playlist — use it directly
+		media := from.(*m3u8.MediaPlaylist)
+		if media.Key != nil {
+			keyURI = strings.Split(media.Key.URI, ",")[0]
+		}
+		for _, seg := range media.Segments {
+			if seg != nil && seg.URI != "" {
+				fileURL = masterURL[:strings.LastIndex(masterURL, "/")] + "/" + seg.URI
+				break
+			}
+		}
+		return masterURL, fileURL, keyURI, "", nil
+	}
+	if listType != m3u8.MASTER {
+		return "", "", "", "", errors.New("expected master playlist from webplayback")
+	}
+	master := from.(*m3u8.MasterPlaylist)
+	best := ""
+	bestBW := uint32(0)
+	for _, v := range master.Variants {
+		if v == nil {
+			continue
+		}
+		isMatch := (codecSub != "" && strings.Contains(v.URI, codecSub)) ||
+			(codecSub != "" && strings.Contains(v.Codecs, codecSub))
+		if !isMatch {
+			continue
+		}
+		if best == "" || v.Bandwidth > bestBW {
+			best = v.URI
+			bestBW = v.Bandwidth
+		}
+	}
+	if best == "" {
+		// fall back to the first variant
+		for _, v := range master.Variants {
+			if v != nil {
+				best = v.URI
+				bestBW = v.Bandwidth
+				break
+			}
+		}
+	}
+	if best == "" {
+		return "", "", "", "", errors.New("no variant found in master playlist")
+	}
+	baseURL := masterURL[:strings.LastIndex(masterURL, "/")]
+	mediaURL = baseURL + "/" + best
+	mediaBody, err := getURLWithHeaders(mediaURL, "", "")
+	if err != nil {
+		return "", "", "", "", err
+	}
+	fromM, listTypeM, err := m3u8.DecodeFrom(strings.NewReader(string(mediaBody)), true)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	if listTypeM != m3u8.MEDIA {
+		return "", "", "", "", errors.New("expected media playlist")
+	}
+	media := fromM.(*m3u8.MediaPlaylist)
+	if media.Key != nil {
+		keyURI = strings.Split(media.Key.URI, ",")[0]
+	}
+	// single-file byte-range layout: the segment file under the playlist
+	for _, seg := range media.Segments {
+		if seg != nil && seg.URI != "" {
+			fileURL = baseURL + "/" + seg.URI
+			break
+		}
+	}
+	// Apple key uris carry no embedded kid, so this is empty (wrapper keys
+	// on adamId + uri, like the fork's aac-lc path).
+	kidBase64 = ""
+	return mediaURL, fileURL, keyURI, kidBase64, nil
+}
+
 func Run(adamId string, trackpath string, authtoken string, mvmode bool, liteServerUrl string) (string, error) {
 	if liteServerUrl == "" {
 		return "", errors.New("lite-server is not configured")

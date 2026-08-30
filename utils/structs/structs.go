@@ -31,6 +31,7 @@ type ConfigSet struct {
 	AppleMasterChoice          string `yaml:"apple-master-choice"`
 	MaxMemoryLimit             int    `yaml:"max-memory-limit"`
 	LiteServer                 string `yaml:"lite-server"`
+	LiteServerToken            string `yaml:"lite-server-token"`
 	GetM3u8Mode                string `yaml:"get-m3u8-mode"`
 	AacType                    string `yaml:"aac-type"`
 	AlacMax                    int    `yaml:"alac-max"`

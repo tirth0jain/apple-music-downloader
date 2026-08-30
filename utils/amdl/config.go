@@ -9,6 +9,8 @@ import (
 	"os"
 	"sort"
 	"strings"
+
+	"main/utils/runv5"
 )
 
 func topLevelKeys(data []byte) map[string]bool {
@@ -31,7 +33,14 @@ func getLiteStorefront() (string, error) {
 		return "", errors.New("lite-server is not configured")
 	}
 	endpoint := strings.TrimRight(Config.LiteServer, "/") + "/status"
-	resp, err := http.Get(endpoint)
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	if Config.LiteServerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+Config.LiteServerToken)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -124,5 +133,7 @@ func loadConfig() error {
 	if Config.MVAudioType == "" {
 		Config.MVAudioType = "atmos"
 	}
+
+	runv5.WrapperToken = Config.LiteServerToken
 	return nil
 }
