@@ -92,10 +92,12 @@ func patchRateOnly(body []byte, rate uint32) []byte {
 	// entry channelcount at body[16:18] (big-endian uint16) — force stereo.
 	out[16], out[17] = 0x00, 0x02
 	// cookie numChannels byte: cookie starts at body[36]; per Apple's
-	// ALACSpecificConfig, numChannels is cookie[9] = body[45]. The sample
-	// entry's channelcount at [16:18] is authoritative — mirror it.
-	if len(out) > 45 {
-		out[45] = out[17]
+	// ALACSpecificConfig, numChannels is cookie[13] = body[49] (cookie
+	// layout: verflags(4) frameLength(4) compat(1) bitDepth(1) pb(1) mb(1)
+	// kb(1) numChannels(1) maxRun(2) ...). The sample entry's channelcount
+	// at [16:18] is authoritative — mirror it into the cookie.
+	if len(out) > 49 {
+		out[49] = out[17]
 	}
 	return out
 }
