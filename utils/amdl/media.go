@@ -492,6 +492,13 @@ func extractMedia(b string, more_mode bool) (string, string, error) {
 		return "", "", nil
 	}
 	var Quality string
+	// Lowest-variant fallback for when caps exclude every ALAC variant.
+	var (
+		fallbackURL    *url.URL
+		fallbackRate   int
+		fallbackDepth  int
+		fallbackLabel  string
+	)
 	for _, variant := range master.Variants {
 		if dl_atmos {
 			if variant.Codecs == "ec-3" && strings.Contains(variant.Audio, "atmos") {
@@ -567,17 +574,31 @@ func extractMedia(b string, more_mode bool) (string, string, error) {
 				if length_int <= max {
 					// Honor per-dimension caps (--max-sample-rate / --max-bit-depth).
 					// split[length-2] = sample rate (Hz), split[length-1] = bit depth.
-					if Config.MaxSampleRate > 0 && length_int > Config.MaxSampleRate {
-						continue
+					// Caps are a PREFERENCE: if no variant meets them, fall back
+					// to the lowest available ALAC and let the caller (rip.sh's
+					// transcode) downsample to the cap. A hard failure would make
+					// 16-bit-cap users unable to rip 24-bit-only masters.
+					bd, berr := strconv.Atoi(split[length-1])
+					if berr != nil {
+						return "", "", berr
 					}
-					if Config.MaxBitDepth > 0 {
-						bd, berr := strconv.Atoi(split[length-1])
-						if berr != nil {
-							return "", "", berr
-						}
-						if bd > Config.MaxBitDepth {
-							continue
-						}
+					meetsCaps := true
+					if Config.MaxSampleRate > 0 && length_int > Config.MaxSampleRate {
+						meetsCaps = false
+					}
+					if Config.MaxBitDepth > 0 && bd > Config.MaxBitDepth {
+						meetsCaps = false
+					}
+					// Track the lowest-quality variant as a fallback (compare by
+					// sample rate first, then bit depth).
+					if fallbackURL == nil || length_int < fallbackRate ||
+						(length_int == fallbackRate && bd < fallbackDepth) {
+						fallbackURL, _ = masterUrl.Parse(variant.URI)
+						fallbackRate, fallbackDepth = length_int, bd
+						fallbackLabel = fmt.Sprintf("%d-bit / %d Hz", bd, length_int)
+					}
+					if !meetsCaps {
+						continue
 					}
 					if !debug_mode && !more_mode {
 						fmt.Printf("%s-bit / %s Hz\n", split[length-1], split[length-2])
@@ -593,6 +614,15 @@ func extractMedia(b string, more_mode bool) (string, string, error) {
 				}
 			}
 		}
+	}
+	if streamUrl == nil && fallbackURL != nil {
+		// No variant met the caps — use the lowest available and note it; the
+		// transcode step (rip.sh) downsamples to the cap.
+		if !debug_mode && !more_mode {
+			fmt.Printf("no variant meets caps, falling back to lowest: %s\n", fallbackLabel)
+		}
+		streamUrl = fallbackURL
+		Quality = fallbackLabel
 	}
 	if streamUrl == nil {
 		return "", "", errors.New("no codec found")
