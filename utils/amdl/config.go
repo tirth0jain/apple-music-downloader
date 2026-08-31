@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"main/utils/runv5"
@@ -146,6 +147,16 @@ func loadConfig() error {
 	}
 	if v := os.Getenv("AMDL_STOREFRONT"); v != "" {
 		Config.Storefront = v
+	}
+	if v := os.Getenv("AMDL_MAX_SAMPLE_RATE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			Config.MaxSampleRate = n
+		}
+	}
+	if v := os.Getenv("AMDL_MAX_BIT_DEPTH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			Config.MaxBitDepth = n
+		}
 	}
 	return nil
 }

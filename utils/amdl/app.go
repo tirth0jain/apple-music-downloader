@@ -19,6 +19,8 @@ var (
 	liteServerFlag     string
 	alac_max           *int
 	atmos_max          *int
+	max_sample_rate    *int
+	max_bit_depth      *int
 	mv_max             *int
 	mv_audio_type      *string
 	aac_type           *string

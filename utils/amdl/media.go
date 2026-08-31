@@ -564,7 +564,21 @@ func extractMedia(b string, more_mode bool) (string, string, error) {
 				if max == 0 {
 					max = 192000
 				}
-				if length_int <= Config.AlacMax {
+				if length_int <= max {
+					// Honor per-dimension caps (--max-sample-rate / --max-bit-depth).
+					// split[length-2] = sample rate (Hz), split[length-1] = bit depth.
+					if Config.MaxSampleRate > 0 && length_int > Config.MaxSampleRate {
+						continue
+					}
+					if Config.MaxBitDepth > 0 {
+						bd, berr := strconv.Atoi(split[length-1])
+						if berr != nil {
+							return "", "", berr
+						}
+						if bd > Config.MaxBitDepth {
+							continue
+						}
+					}
 					if !debug_mode && !more_mode {
 						fmt.Printf("%s-bit / %s Hz\n", split[length-1], split[length-2])
 					}

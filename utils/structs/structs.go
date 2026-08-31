@@ -35,6 +35,8 @@ type ConfigSet struct {
 	GetM3u8Mode                string `yaml:"get-m3u8-mode"`
 	AacType                    string `yaml:"aac-type"`
 	AlacMax                    int    `yaml:"alac-max"`
+	MaxSampleRate              int    `yaml:"max-sample-rate"`
+	MaxBitDepth                int    `yaml:"max-bit-depth"`
 	AtmosMax                   int    `yaml:"atmos-max"`
 	LimitMax                   int    `yaml:"limit-max"`
 	UseSongInfoForPlaylist     bool   `yaml:"use-songinfo-for-playlist"`

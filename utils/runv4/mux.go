@@ -70,8 +70,13 @@ var alacEntryBody = []byte{
 // patchAudioParams - set channelcount, samplesize and samplerate in both the
 // entry fields and the ALAC magic cookie. The AudioSampleEntry samplerate is
 // 16.16 fixed-point (44100 << 16); the magic cookie stores it raw.
-// patchRateOnly - normalize just the two samplerate fields (entry 16.16
-// field + magic-cookie raw rate), leaving Apple's cookie bytes untouched.
+// patchRateOnly - normalize the samplerate fields (entry 16.16 field +
+// magic-cookie raw rate) AND force a sane channel count, leaving the rest of
+// Apple's cookie bytes untouched. Apple's hires init occasionally carries a
+// cookie whose channel byte reads as 0x10 (16) for ordinary stereo masters;
+// ffmpeg then refuses to decode ("Channel count 16 is not implemented") and
+// the FLAC transcode produces a corrupt header. The actual ALAC frames are
+// stereo, so normalizing to 2 is always safe.
 func patchRateOnly(body []byte, rate uint32) []byte {
 	out := make([]byte, len(body))
 	copy(out, body)
@@ -84,6 +89,14 @@ func patchRateOnly(body []byte, rate uint32) []byte {
 	out[61] = byte(rate >> 16)
 	out[62] = byte(rate >> 8)
 	out[63] = byte(rate)
+	// entry channelcount at body[16:18] (big-endian uint16) — force stereo.
+	out[16], out[17] = 0x00, 0x02
+	// cookie numChannels byte: cookie starts at body[36]; per Apple's
+	// ALACSpecificConfig, numChannels is cookie[9] = body[45]. The sample
+	// entry's channelcount at [16:18] is authoritative — mirror it.
+	if len(out) > 45 {
+		out[45] = out[17]
+	}
 	return out
 }
 

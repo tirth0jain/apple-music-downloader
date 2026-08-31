@@ -57,6 +57,8 @@ func Main() {
 	pflag.BoolVar(&save_m3u8_playlist, "save-m3u8-playlist", false, "Save M3U8 playlist file")
 	pflag.StringVar(&liteServerFlag, "lite-server", Config.LiteServer, "wrapper-lite HTTP API endpoint for this run")
 	alac_max = pflag.Int("alac-max", Config.AlacMax, "Specify the max quality for download alac")
+	max_sample_rate = pflag.Int("max-sample-rate", Config.MaxSampleRate, "Specify the max sample rate in Hz (e.g., 44100, 48000, 96000). 0 = no limit")
+	max_bit_depth = pflag.Int("max-bit-depth", Config.MaxBitDepth, "Specify the max bit depth (e.g., 16, 24). 0 = no limit")
 	atmos_max = pflag.Int("atmos-max", Config.AtmosMax, "Specify the max quality for download atmos")
 	aac_type = pflag.String("aac-type", Config.AacType, "Select AAC type, aac aac-binaural aac-downmix")
 	mv_audio_type = pflag.String("mv-audio-type", Config.MVAudioType, "Select MV audio type, atmos ac3 aac")
@@ -74,6 +76,8 @@ func Main() {
 		Config.LiteServer = liteServerFlag
 	}
 	Config.AlacMax = *alac_max
+	Config.MaxSampleRate = *max_sample_rate
+	Config.MaxBitDepth = *max_bit_depth
 	Config.AtmosMax = *atmos_max
 	Config.AacType = *aac_type
 	Config.MVAudioType = *mv_audio_type
