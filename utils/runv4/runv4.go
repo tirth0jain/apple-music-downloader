@@ -245,6 +245,22 @@ func downloadWithResume(ctx context.Context, client *http.Client, fileUrl string
 		downloadMaxAttempts, offset, totalLen)
 }
 
+// variantRate/variantDepth — the ALAC variant's true sample rate (Hz) and
+// bit depth for the current rip, threaded in from amdl's HLS variant
+// selection. Apple's hi-res init segment carries an enca AudioSampleEntry
+// whose 16.16 sample-rate field is a 1-Hz placeholder and whose samplesize
+// field can also be a stub; the real values only appear in the HLS
+// #EXT-X-MEDIA attributes (SAMPLE-RATE / BIT-DEPTH), which amdl parses when
+// picking the variant. The muxer falls back to these when the init bytes are
+// placeholder/stub values so 192k/24 rips produce a valid m4a.
+var variantRate, variantDepth int
+
+// SetVariantInfo records the ALAC variant's true sample rate / bit depth for
+// the upcoming mux. Called by amdl immediately before Run.
+func SetVariantInfo(rate, depth int) {
+	variantRate, variantDepth = rate, depth
+}
+
 func Run(adamId string, playlistUrl string, outfile string, Config structs.ConfigSet) error {
 	if Config.LiteServer == "" {
 		return errors.New("lite-server is not configured in config.yaml")
@@ -827,7 +843,7 @@ func muxFragments(init *mp4.InitSegment, samples []mp4.FullSample, w *bufio.Writ
 	if len(samples) == 0 {
 		return errors.New("no samples to mux")
 	}
-	if err := MuxStandardM4A(init, samples, w); err != nil {
+	if err := MuxStandardM4A(init, samples, w, variantRate, variantDepth); err != nil {
 		return err
 	}
 	return nil

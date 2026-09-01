@@ -223,6 +223,13 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		}
 		//边下载边解密
 		//wrapper-lite 模板解密
+		// Thread the selected ALAC variant's sample rate / bit depth into the
+		// muxer: Apple's hi-res init carries an enca entry whose rate field is
+		// a 1-Hz placeholder, so the muxer needs the true rate from the HLS
+		// variant selection to write a valid m4a (192k/24 rips otherwise come
+		// out with sample_rate=1 and ffmpeg rejects them at transcode).
+		rate, depth := RunVariantInfo()
+		runv4.SetVariantInfo(rate, depth)
 		err = runv4.Run(track.ID, trackM3u8Url, trackPath, Config)
 		if err != nil {
 			fmt.Println("Failed to run v4:", err)

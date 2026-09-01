@@ -362,7 +362,25 @@ func formatAvailability(available bool, quality string) string {
 	return quality
 }
 
+// selectedRate/selectedDepth — the sample rate (Hz) and bit depth of the
+// ALAC variant extractMedia picked for the CURRENT rip. Apple's hi-res init
+// segment carries an enca AudioSampleEntry whose 16.16 sample-rate field is
+// a 1-Hz placeholder (the real rate lives only in the HLS #EXT-X-MEDIA
+// SAMPLE-RATE attribute), so the muxer must learn the true rate from the
+// variant selection instead of the init bytes. Set by extractMedia on every
+// ALAC selection (and cleared for non-ALAC picks); consumed by runv4 via
+// RunVariantInfo before muxing.
+var selectedRate, selectedDepth int
+
+// RunVariantInfo returns the sample rate/bit depth of the ALAC variant last
+// selected by extractMedia (0 = unknown / not an ALAC pick).
+func RunVariantInfo() (int, int) { return selectedRate, selectedDepth }
+
 func extractMedia(b string, more_mode bool) (string, string, error) {
+	// Reset per-rip variant info: extractMedia is called both for quality
+	// preview (more_mode) and the actual rip — only the final selection
+	// before runv4.Run matters, and rip.go calls it immediately before.
+	selectedRate, selectedDepth = 0, 0
 	masterUrl, err := url.Parse(b)
 	if err != nil {
 		return "", "", err
@@ -608,6 +626,7 @@ func extractMedia(b string, more_mode bool) (string, string, error) {
 						panic(err)
 					}
 					streamUrl = streamUrlTemp
+					selectedRate, selectedDepth = length_int, bd
 					KHZ := float64(length_int) / 1000.0
 					Quality = fmt.Sprintf("%sB-%.1fkHz", split[length-1], KHZ)
 					break
@@ -622,6 +641,7 @@ func extractMedia(b string, more_mode bool) (string, string, error) {
 			fmt.Printf("no variant meets caps, falling back to lowest: %s\n", fallbackLabel)
 		}
 		streamUrl = fallbackURL
+		selectedRate, selectedDepth = fallbackRate, fallbackDepth
 		Quality = fallbackLabel
 	}
 	if streamUrl == nil {

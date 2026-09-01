@@ -80,7 +80,10 @@ var alacEntryBody = []byte{
 func patchRateOnly(body []byte, rate uint32) []byte {
 	out := make([]byte, len(body))
 	copy(out, body)
-	rateFixed := rate << 16
+	// 16.16 fixed-point: compute in uint64 — rate<<16 overflows uint32 for
+	// rates >= 65536 Hz (e.g. 192000<<16 = 0x2EE000000 wraps to 0xEE000000),
+	// which would corrupt the entry samplerate for hi-res rips.
+	rateFixed := uint64(rate) << 16
 	out[24] = byte(rateFixed >> 24)
 	out[25] = byte(rateFixed >> 16)
 	out[26] = byte(rateFixed >> 8)
@@ -111,7 +114,8 @@ func patchAudioParams(body []byte, channels uint16, sampleSize uint16, rate uint
 	out[19] = byte(sampleSize)
 	// magic-cookie bitDepth byte (body[45] = entry[53])
 	out[45] = byte(sampleSize)
-	rateFixed := rate << 16
+	// 16.16 fixed-point in uint64 (see patchRateOnly — overflow at >=65536 Hz)
+	rateFixed := uint64(rate) << 16
 	out[24] = byte(rateFixed >> 24)
 	out[25] = byte(rateFixed >> 16)
 	out[26] = byte(rateFixed >> 8)
@@ -124,8 +128,12 @@ func patchAudioParams(body []byte, channels uint16, sampleSize uint16, rate uint
 }
 
 // MuxStandardM4A - write a standard m4a (ftyp + moov + mdat) from decrypted
-// fragment samples. Audio parameters come from the source stsd entry.
-func MuxStandardM4A(init *mp4.InitSegment, samples []mp4.FullSample, w io.Writer) error {
+// fragment samples. Audio parameters come from the source stsd entry, with
+// the ALAC variant's true sample rate / bit depth (variantRate/variantDepth,
+// from the HLS #EXT-X-MEDIA attributes) used to override placeholder values:
+// Apple's hi-res init carries an enca entry whose 16.16 sample-rate field is
+// 1 Hz and whose samplesize field can be a 16-bit stub for 24-bit tracks.
+func MuxStandardM4A(init *mp4.InitSegment, samples []mp4.FullSample, w io.Writer, variantRate, variantDepth int) error {
 	if len(samples) == 0 {
 		return fmt.Errorf("no samples to mux")
 	}
@@ -149,7 +157,20 @@ func MuxStandardM4A(init *mp4.InitSegment, samples []mp4.FullSample, w io.Writer
 			srcEntry = b
 		}
 	}
-	if sampleRate == 0 {
+	// Apple's hi-res init entries are `enca` (encrypted) stubs: the 16.16
+	// sample-rate field is a 1-Hz placeholder and samplesize is often 16 even
+	// for 24-bit tracks. The real values live in the HLS variant attributes
+	// (parsed by amdl and passed in as variantRate/variantDepth) — use them
+	// whenever the init bytes look like placeholders.
+	if variantRate > 0 && (sampleRate == 0 || sampleRate == 1 || sampleRate > 384000) {
+		sampleRate = uint32(variantRate)
+	}
+	if variantDepth > 0 && (sampleSize == 0 || sampleSize == 16) && variantDepth == 24 {
+		// 16 is a legitimate value for true 16-bit tracks; only promote when
+		// the variant says 24-bit (the enca stub case).
+		sampleSize = uint16(variantDepth)
+	}
+	if sampleRate == 0 || sampleRate == 1 {
 		sampleRate = 44100
 	}
 
