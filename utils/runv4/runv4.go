@@ -27,6 +27,55 @@ const prefetchKey = "skd://itunes.apple.com/P000000000/s1/e1"
 
 var ErrTimeout = errors.New("response timed out")
 
+// package-level template cache, shared between Run's prefetch (during the
+// media download) and the decrypt workers (after the download). Fetching a
+// template is idempotent — the wrapper /key round trip returns the same
+// ctx/state/regs for a given key URI within a session — so overlapping the
+// fetch with the download is safe: the decrypt pipeline consumes exactly the
+// same template it would have fetched lazily, just without the serial wait.
+// The cache is keyed by key URI and guarded by a mutex (the decrypt workers
+// already serialize on templateFor; this keeps that behavior).
+var (
+	tmplCacheMu sync.Mutex
+	tmplCache   = map[string]*template{}
+)
+
+// prefetchTemplateFor starts an asynchronous fetch of the template for uri
+// (unless it is the compiled-in prefetch template or already cached) so the
+// wrapper /key round trip overlaps the media download. It never blocks the
+// caller: on any failure the decrypt workers fall back to the lazy fetch.
+func prefetchTemplateFor(liteServer, adamId, uri, token string) {
+	if uri == "" || uri == prefetchKey {
+		return
+	}
+	tmplCacheMu.Lock()
+	_, ok := tmplCache[uri]
+	tmplCacheMu.Unlock()
+	if ok {
+		return
+	}
+	go func() {
+		t, err := fetchTemplate(liteServer, adamId, uri, token)
+		if err != nil {
+			// leave the cache empty — the decrypt path will retry lazily
+			return
+		}
+		tmplCacheMu.Lock()
+		if _, exists := tmplCache[uri]; !exists {
+			tmplCache[uri] = t
+		}
+		tmplCacheMu.Unlock()
+	}()
+}
+
+// cachedTemplate returns the cached template for uri, if present.
+func cachedTemplate(uri string) (*template, bool) {
+	tmplCacheMu.Lock()
+	defer tmplCacheMu.Unlock()
+	t, ok := tmplCache[uri]
+	return t, ok
+}
+
 type TimedResponseBody struct {
 	timeout   time.Duration
 	timer     *time.Timer
@@ -421,6 +470,24 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 		totalLen = do.ContentLength
 	}
 
+	// The key URI is known from the playlist before the download: overlap the
+	// wrapper /key template round trip with the media download so the decrypt
+	// pipeline (which starts only after the file is fully downloaded) finds
+	// the template already cached. Failure to prefetch is harmless — the
+	// decrypt path fetches lazily exactly as before.
+	prefetchURI := defaultKeyURI
+	if prefetchURI == "" && segmentsHaveKey(segments) {
+		for _, seg := range segments {
+			if seg != nil && seg.Key != nil && seg.Key.URI != "" {
+				prefetchURI = seg.Key.URI
+				break
+			}
+		}
+	}
+	if prefetchURI != "" {
+		prefetchTemplateFor(Config.LiteServer, adamId, prefetchURI, Config.LiteServerToken)
+	}
+
 	err = downloadAndDecryptFile(Config.LiteServer, body, outfile, adamId, segments, totalLen, defaultKeyURI, Config)
 	if err != nil {
 		return err
@@ -473,17 +540,18 @@ func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
 		fmt.Printf("Warning: unable to sanitize init completely: %s\n", err)
 	}
 
-	// Decrypt templates per key uri, cached (thread-safe). s1/e1 uses the
-	// built-in prefetch template; other uris are fetched from wrapper-lite
-	// /key (ctx/state/regs) lazily on first use.
-	var tmplMu sync.Mutex
-	tmplCache := map[string]*template{}
+	// Decrypt templates per key uri, cached (thread-safe, shared with Run's
+	// prefetch). s1/e1 uses the built-in prefetch template; other uris are
+	// fetched from wrapper-lite /key (ctx/state/regs) lazily on first use.
 	templateFor := func(uri string) (*template, error) {
 		if uri == prefetchKey || uri == "" {
 			return prefetchTemplate(), nil
 		}
-		tmplMu.Lock()
-		defer tmplMu.Unlock()
+		if t, ok := cachedTemplate(uri); ok {
+			return t, nil
+		}
+		tmplCacheMu.Lock()
+		defer tmplCacheMu.Unlock()
 		if t, ok := tmplCache[uri]; ok {
 			return t, nil
 		}
