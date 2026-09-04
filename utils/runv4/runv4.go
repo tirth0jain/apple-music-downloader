@@ -356,6 +356,27 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 		}
 	}
 
+	// The key URI is known from the playlist BEFORE the download: fire the
+	// async wrapper /key template prefetch now so the round trip overlaps the
+	// (multi-second) byte-range download. The decrypt pipeline starts only
+	// after the full download and finds the template already cached — the
+	// /key wait never sits on the critical path. (Placing this after the
+	// download, as originally, made the goroutine race the decrypt workers
+	// for the same fetch and gained nothing.) Failure to prefetch is
+	// harmless — the decrypt path fetches lazily exactly as before.
+	prefetchURI := defaultKeyURI
+	if prefetchURI == "" && segmentsHaveKey(segments) {
+		for _, seg := range segments {
+			if seg != nil && seg.Key != nil && seg.Key.URI != "" {
+				prefetchURI = seg.Key.URI
+				break
+			}
+		}
+	}
+	if prefetchURI != "" {
+		prefetchTemplateFor(Config.LiteServer, adamId, prefetchURI, Config.LiteServerToken)
+	}
+
 	// get URL to the actual file
 	parsedUrl, err := url.Parse(playlistUrl)
 	if err != nil {
@@ -470,24 +491,9 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 		totalLen = do.ContentLength
 	}
 
-	// The key URI is known from the playlist before the download: overlap the
-	// wrapper /key template round trip with the media download so the decrypt
-	// pipeline (which starts only after the file is fully downloaded) finds
-	// the template already cached. Failure to prefetch is harmless — the
-	// decrypt path fetches lazily exactly as before.
-	prefetchURI := defaultKeyURI
-	if prefetchURI == "" && segmentsHaveKey(segments) {
-		for _, seg := range segments {
-			if seg != nil && seg.Key != nil && seg.Key.URI != "" {
-				prefetchURI = seg.Key.URI
-				break
-			}
-		}
-	}
-	if prefetchURI != "" {
-		prefetchTemplateFor(Config.LiteServer, adamId, prefetchURI, Config.LiteServerToken)
-	}
-
+	// The media body is ready (temp file or memory buffer). The template
+	// prefetch fired above (before the download), so the decrypt pipeline
+	// below finds it cached. downloadAndDecryptFile decrypts + re-muxes.
 	err = downloadAndDecryptFile(Config.LiteServer, body, outfile, adamId, segments, totalLen, defaultKeyURI, Config)
 	if err != nil {
 		return err
