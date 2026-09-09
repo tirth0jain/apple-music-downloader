@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"main/utils/phase"
 	"main/utils/structs"
 
 	"github.com/grafov/m3u8"
@@ -314,6 +315,7 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 	if Config.LiteServer == "" {
 		return errors.New("lite-server is not configured in config.yaml")
 	}
+	ph0 := phase.Start()
 	var err error
 	var optstimeout uint
 	optstimeout = 0
@@ -344,6 +346,7 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 	if segment.Limit <= 0 {
 		return errors.New("non-byterange playlists are currently unsupported")
 	}
+	phase.Since(ph0, "media_playlist_fetched")
 
 	// If the playlist carries no EXT-X-KEY (Apple sometimes omits it from the
 	// web-API copy), fall back to the wrapper's OWN session playlist — the
@@ -494,10 +497,12 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 	// The media body is ready (temp file or memory buffer). The template
 	// prefetch fired above (before the download), so the decrypt pipeline
 	// below finds it cached. downloadAndDecryptFile decrypts + re-muxes.
+	phase.Since(ph0, "download_done")
 	err = downloadAndDecryptFile(Config.LiteServer, body, outfile, adamId, segments, totalLen, defaultKeyURI, Config)
 	if err != nil {
 		return err
 	}
+	phase.Since(ph0, "decrypt_mux_done")
 	fmt.Print("Decrypted\n")
 	return nil
 }
@@ -646,6 +651,7 @@ func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
 		workerWg.Add(1)
 		eg.Go(func() error {
 			defer workerWg.Done()
+			ws := &decryptWorkspace{}
 			for {
 				select {
 				case <-ctx.Done():
@@ -661,7 +667,7 @@ func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
 					if err != nil {
 						return fmt.Errorf("template seq %d: %w", job.Seq, err)
 					}
-					samples, err := DecryptFragment(job.Frag, tracks, tmpl)
+					samples, err := DecryptFragment(job.Frag, tracks, tmpl, ws)
 					if err != nil {
 						return fmt.Errorf("tmpl decrypt seq %d: %w", job.Seq, err)
 					}
@@ -942,7 +948,7 @@ func TransformInit(init *mp4.InitSegment) (map[uint32]mp4.DecryptTrackInfo, erro
 }
 
 // Decryption function dispatcher
-func cbcsDecryptRaw(data []byte, decryptBlockLen, skipBlockLen int, tmpl *template) error {
+func cbcsDecryptRaw(data []byte, decryptBlockLen, skipBlockLen int, tmpl *template, ws *decryptWorkspace) error {
 	if skipBlockLen != 0 {
 		return fmt.Errorf("not full encryption of subsamples")
 	}
@@ -951,7 +957,7 @@ func cbcsDecryptRaw(data []byte, decryptBlockLen, skipBlockLen int, tmpl *templa
 	// function would just return them as-is, but we're truncating the data here
 	// for clarity and interoperability
 	truncatedLen := len(data) & ^0xf
-	decrypted := decryptSample(tmpl, data[:truncatedLen])
+	decrypted := decryptSampleInto(tmpl, data[:truncatedLen], ws)
 	copy(data[:truncatedLen], decrypted)
 	// Full encryption of subsamples
 	// e.g. Apple Music ALAC
@@ -959,7 +965,7 @@ func cbcsDecryptRaw(data []byte, decryptBlockLen, skipBlockLen int, tmpl *templa
 }
 
 // Decrypt a cbcs-encrypted sample in-place
-func cbcsDecryptSample(sample []byte, subSamplePatterns []mp4.SubSamplePattern, tenc *mp4.TencBox, tmpl *template) error {
+func cbcsDecryptSample(sample []byte, subSamplePatterns []mp4.SubSamplePattern, tenc *mp4.TencBox, tmpl *template, ws *decryptWorkspace) error {
 
 	decryptBlockLen := int(tenc.DefaultCryptByteBlock) * 16
 	skipBlockLen := int(tenc.DefaultSkipByteBlock) * 16
@@ -967,7 +973,7 @@ func cbcsDecryptSample(sample []byte, subSamplePatterns []mp4.SubSamplePattern, 
 
 	// Full sample encryption
 	if len(subSamplePatterns) == 0 {
-		return cbcsDecryptRaw(sample, decryptBlockLen, skipBlockLen, tmpl)
+		return cbcsDecryptRaw(sample, decryptBlockLen, skipBlockLen, tmpl, ws)
 	}
 
 	// Has subsamples
@@ -980,7 +986,7 @@ func cbcsDecryptSample(sample []byte, subSamplePatterns []mp4.SubSamplePattern, 
 			continue
 		}
 
-		err := cbcsDecryptRaw(sample[pos:pos+ss.BytesOfProtectedData], decryptBlockLen, skipBlockLen, tmpl)
+		err := cbcsDecryptRaw(sample[pos:pos+ss.BytesOfProtectedData], decryptBlockLen, skipBlockLen, tmpl, ws)
 		if err != nil {
 			return err
 		}
@@ -992,14 +998,14 @@ func cbcsDecryptSample(sample []byte, subSamplePatterns []mp4.SubSamplePattern, 
 
 // Decrypt an array of cbcs-encrypted samples in-place
 func cbcsDecryptSamples(samples []mp4.FullSample, tmpl *template,
-	tenc *mp4.TencBox, senc *mp4.SencBox) error {
+	tenc *mp4.TencBox, senc *mp4.SencBox, ws *decryptWorkspace) error {
 
 	for i := range samples {
 		var subSamplePatterns []mp4.SubSamplePattern
 		if len(senc.SubSamples) != 0 {
 			subSamplePatterns = senc.SubSamples[i]
 		}
-		err := cbcsDecryptSample(samples[i].Data, subSamplePatterns, tenc, tmpl)
+		err := cbcsDecryptSample(samples[i].Data, subSamplePatterns, tenc, tmpl, ws)
 		if err != nil {
 			return err
 		}
@@ -1008,7 +1014,7 @@ func cbcsDecryptSamples(samples []mp4.FullSample, tmpl *template,
 }
 
 // Decrypt a cbcs-encrypted sample in-place
-func DecryptFragment(frag *mp4.Fragment, tracks map[uint32]mp4.DecryptTrackInfo, tmpl *template) ([]mp4.FullSample, error) {
+func DecryptFragment(frag *mp4.Fragment, tracks map[uint32]mp4.DecryptTrackInfo, tmpl *template, ws *decryptWorkspace) ([]mp4.FullSample, error) {
 	moof := frag.Moof
 	var bytesRemoved uint64 = 0
 	var allSamples []mp4.FullSample
@@ -1056,7 +1062,7 @@ func DecryptFragment(frag *mp4.Fragment, tracks map[uint32]mp4.DecryptTrackInfo,
 			return nil, err
 		}
 
-		err = cbcsDecryptSamples(samples, tmpl, ti.Sinf.Schi.Tenc, senc)
+		err = cbcsDecryptSamples(samples, tmpl, ti.Sinf.Schi.Tenc, senc, ws)
 		if err != nil {
 			return nil, err
 		}

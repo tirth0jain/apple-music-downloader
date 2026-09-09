@@ -4,7 +4,7 @@
 package runv4
 
 func prefetchTemplate() *template {
-	return &template{
+	t := &template{
 		ctx: []u32{
 			0x22, 0xde, 0xb9, 0x58, 0x76, 0xd8, 0x53, 0x02,
 			0xcf, 0x09, 0x57, 0x02, 0xc0, 0xa9, 0x02, 0xd4,
@@ -4369,4 +4369,6 @@ func prefetchTemplate() *template {
 			rbp: 0xae5e8ef0,
 		},
 	}
+	t.prepare()
+	return t
 }

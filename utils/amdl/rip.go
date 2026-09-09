@@ -5,6 +5,7 @@ import (
 	"main/utils/alacfix"
 	"main/utils/ampapi"
 	"main/utils/lyrics"
+	"main/utils/phase"
 	"main/utils/runv3"
 	"main/utils/runv4"
 	"main/utils/runv5"
@@ -19,6 +20,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	var err error
 	counter.Total++
 	fmt.Printf("Track %d of %d: %s\n", track.TaskNum, track.TaskTotal, track.Type)
+	ph0 := phase.Start()
 
 	//mv dl dev
 	if track.Type == "music-videos" {
@@ -230,12 +232,14 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		// out with sample_rate=1 and ffmpeg rejects them at transcode).
 		rate, depth := RunVariantInfo()
 		runv4.SetVariantInfo(rate, depth)
+		phase.Since(ph0, "prep_done_master+media+variant")
 		err = runv4.Run(track.ID, trackM3u8Url, trackPath, Config)
 		if err != nil {
 			fmt.Println("Failed to run v4:", err)
 			counter.Error++
 			return
 		}
+		phase.Since(ph0, "v4_run_done")
 
 	}
 	//这里利用MP4box将fmp4转化为mp4，并添加ilst box与cover，方便后面的mp4tag添加更多自定义标签
@@ -526,6 +530,7 @@ func ripAlbum(albumId string, token string, storefront string, mediaUserToken st
 		fmt.Println("Failed to get album response.")
 		return err
 	}
+	phase.Since(phase.Start(), "album_catalog_resp")
 	meta := album.Resp
 	if debug_mode {
 		fmt.Println(meta.Data[0].Attributes.ArtistName)
@@ -1047,12 +1052,14 @@ func ripPlaylist(playlistId string, token string, storefront string, mediaUserTo
 }
 
 func ripSong(songId string, token string, storefront string, mediaUserToken string) error {
+	ph0 := phase.Start()
 	// Get song info to find album ID
 	manifest, err := ampapi.GetSongResp(storefront, songId, Config.Language, token)
 	if err != nil {
 		fmt.Println("Failed to get song response.")
 		return err
 	}
+	phase.Since(ph0, "song_catalog_resp")
 
 	songData := manifest.Data[0]
 	albumId := songData.Relationships.Albums.Data[0].ID
