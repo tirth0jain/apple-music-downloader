@@ -142,6 +142,13 @@ func loadConfig() error {
 	if v := os.Getenv("AMDL_SAVE_FOLDER"); v != "" {
 		Config.AlacSaveFolder = v
 	}
+	// AAC-mode downloads go to AacSaveFolder (NOT AlacSaveFolder), so the
+	// wrapper needs a separate override or the m4a lands in the default
+	// folder where rip.sh can never find it (and stale copies there make
+	// amdl print "Track already exists locally" — silent no-output rips).
+	if v := os.Getenv("AMDL_AAC_SAVE_FOLDER"); v != "" {
+		Config.AacSaveFolder = v
+	}
 	if v := os.Getenv("AMDL_LITE_SERVER"); v != "" {
 		Config.LiteServer = v
 	}
