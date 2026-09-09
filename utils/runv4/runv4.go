@@ -1,6 +1,7 @@
 package runv4
 
 import (
+	"strconv"
 	"bufio"
 	"bytes"
 	"context"
@@ -193,7 +194,8 @@ func downloadParallelRanges(ctx context.Context, client *http.Client, fileUrl st
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(ranges))
-	for i := 0; i < parallelRangeWorkers; i++ {
+	rangeWorkers := envWorkers("AMDL_RANGE_WORKERS", parallelRangeWorkers)
+	for i := 0; i < rangeWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -308,6 +310,17 @@ var variantRate, variantDepth int
 // the upcoming mux. Called by amdl immediately before Run.
 func SetVariantInfo(rate, depth int) {
 	variantRate, variantDepth = rate, depth
+}
+
+// envWorkers returns the env-overridden worker count for a knob name
+// (AMDL_DECRYPT_WORKERS / AMDL_RANGE_WORKERS), clamped to [1,64].
+func envWorkers(name string, def int) int {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 64 {
+			return n
+		}
+	}
+	return def
 }
 
 func Run(adamId string, playlistUrl string, outfile string, Config structs.ConfigSet) error {
@@ -640,9 +653,10 @@ func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
 		}
 	})
 
-	// 3. 启动固定 10 个解密 Worker (乱序执行)
+	// 3. 解密 Worker (乱序执行) — count tunable via AMDL_DECRYPT_WORKERS
+	decryptWorkers := envWorkers("AMDL_DECRYPT_WORKERS", 10)
 	var workerWg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for i := 0; i < decryptWorkers; i++ {
 		workerWg.Add(1)
 		eg.Go(func() error {
 			defer workerWg.Done()

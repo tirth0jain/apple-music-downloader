@@ -182,7 +182,15 @@ func Main() {
 				}
 				err := ripSong(songId, token, storefront, Config.MediaUserToken)
 				if err != nil {
+					// Print to BOTH streams: stdout keeps the human summary,
+					// stderr is what rip.sh captures for the addon's failure
+					// classifier. Count it so exit-on-error actually exits
+					// non-zero (a top-level catalog failure used to slip
+					// through with rc=0 and NO output file — the "silent
+					// no-m4a" class, e.g. Apple 404).
 					fmt.Println("Failed to rip song:", err)
+					fmt.Fprintf(os.Stderr, "ERROR: failed to rip song %s: %v\n", songId, err)
+					counter.Error++
 				}
 				continue
 			}
@@ -198,6 +206,8 @@ func Main() {
 				err := ripAlbum(albumId, token, storefront, Config.MediaUserToken, urlArg_i)
 				if err != nil {
 					fmt.Println("Failed to rip album:", err)
+					fmt.Fprintf(os.Stderr, "ERROR: failed to rip album %s: %v\n", albumId, err)
+					counter.Error++
 				}
 			} else if strings.Contains(urlRaw, "/playlist/") {
 				fmt.Println("Playlist")
@@ -205,6 +215,8 @@ func Main() {
 				err := ripPlaylist(albumId, token, storefront, Config.MediaUserToken)
 				if err != nil {
 					fmt.Println("Failed to rip playlist:", err)
+					fmt.Fprintf(os.Stderr, "ERROR: failed to rip playlist %s: %v\n", albumId, err)
+					counter.Error++
 				}
 			} else if strings.Contains(urlRaw, "/station/") {
 				fmt.Printf("Station")
@@ -216,6 +228,8 @@ func Main() {
 				err := ripStation(albumId, token, storefront, Config.MediaUserToken)
 				if err != nil {
 					fmt.Println("Failed to rip station:", err)
+					fmt.Fprintf(os.Stderr, "ERROR: failed to rip station %s: %v\n", albumId, err)
+					counter.Error++
 				}
 			} else {
 				fmt.Println("Invalid type")
@@ -228,6 +242,14 @@ func Main() {
 			fmt.Println("Error detected, exiting...")
 			os.Exit(1)
 		} else {
+			// Interactive retry needs a terminal; under rip.sh (no tty, stdin
+			// closed) Scanln would return EOF instantly and spin forever.
+			// Exit non-zero instead so the caller sees the failure.
+			fi, statErr := os.Stdin.Stat()
+			if statErr != nil || (fi.Mode()&os.ModeCharDevice) == 0 {
+				fmt.Println("Error detected, no terminal for retry — exiting")
+				os.Exit(1)
+			}
 			fmt.Println("Error detected, press Enter to try again...")
 			fmt.Scanln()
 			fmt.Println("Start trying again...")
