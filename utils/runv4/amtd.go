@@ -10,13 +10,36 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 type template struct {
-	ctx   []u32
-	st    St
-	entry Round1Regs
+	ctx     []u32
+	tbl     []u32
+	tblOnce sync.Once
+	st      St
+	entry   Round1Regs
+
+	// Values of st slots that are read every block but never written.
+	c5b8, c5f0, c538, c540 u32
+}
+
+// prepare lazily builds the precomputed t4 lookup table for ctx and caches
+// the read-only st constants used by decryptSample's per-block loop.
+func (t *template) prepare() {
+	t.tblOnce.Do(func() {
+		tbl := make([]u32, len(t.ctx)/4)
+		for i := range tbl {
+			j := i << 2
+			tbl[i] = t.ctx[j] | t.ctx[j+1]<<8 | t.ctx[j+2]<<16 | t.ctx[j+3]<<24
+		}
+		t.tbl = tbl
+		t.c5b8 = t.st[0x5b8]
+		t.c5f0 = t.st[0x5f0]
+		t.c538 = t.st[0x538]
+		t.c540 = t.st[0x540]
+	})
 }
 
 type templateResponse struct {
@@ -107,26 +130,40 @@ func fetchTemplate(baseURL, adam, uri, token string) (*template, error) {
 	return tmpl, nil
 }
 
+// decryptWorkspace holds buffers that are reused across samples within one
+// connection, avoiding per-sample allocations in the hot path.
+type decryptWorkspace struct {
+	buf []byte
+	out []byte
+}
+
 func decryptSample(tmpl *template, sample []byte) []byte {
-	out := make([]byte, len(sample))
-	copy(out[len(sample)/16*16:], sample[len(sample)/16*16:])
-	ct := make([]u32, len(sample))
-	for i, b := range sample {
-		ct[i] = u32(b)
+	return decryptSampleInto(tmpl, sample, &decryptWorkspace{})
+}
+
+func decryptSampleInto(tmpl *template, sample []byte, ws *decryptWorkspace) []byte {
+	tmpl.prepare()
+	tbl := tmpl.tbl
+	out := ws.out
+	if cap(out) < len(sample) {
+		out = make([]byte, len(sample))
+	} else {
+		out = out[:len(sample)]
 	}
+	copy(out[len(sample)/16*16:], sample[len(sample)/16*16:])
 	st := tmpl.st
 	for block := 0; block < len(sample)/16; block++ {
 		regs := tmpl.entry
 		regs.rdi = u32(0x1EB2C6B4) ^ (u32(block) << 4)
 		regs.rsi = u32(8) + (u32(block) << 4)
-		mid := round1Mid(tmpl.ctx, &st, ct, &regs)
-		r2 := round1Tail(tmpl.ctx, &st, mid.rax, mid.r13&0xff, mid.r15&0xff, mid.r8&0xff, mid.r14&0xff)
-		r2v := round2Sub6400(tmpl.ctx, &st, r2.rdi, r2.rsi, r2.rdx, r2.rcx, r2.r8, r2.r9, r2.rax, r2.rbx, r2.r10, r2.r11, r2.r13, r2.r14, r2.r15, 0)
-		r8p := r2v.cp12[2] ^ st[0x5b8] ^ r2v.cp12[1]
-		v6 := t4(tmpl.ctx, 0x46a0, st[0x390]^0x2b) ^ st[0x5f0] ^ t4(tmpl.ctx, 0x4ac0, (r8p>>24)^0x29) ^ t4(tmpl.ctx, 0x2ff0, (st[0x298]>>16)^0xd6)
-		v9 := t4(tmpl.ctx, 0x4ac0, r2v.cp12[0]) ^ st[0x540] ^ t4(tmpl.ctx, 0x2ff0, (r2v.v171>>16)^0x69)
-		v11 := t4(tmpl.ctx, 0x3950, st[0x298]^0x57) ^ st[0x538] ^ t4(tmpl.ctx, 0x46a0, (r8p>>8)^0x2f)
-		r3 := round3Sub8000(tmpl.ctx, &st, st[0x270], r2v.v189, r8p&0xff, (r8p>>16)&0xffff, st[0x280], v6, (r8p>>16)&0xff, v9, r2v.v187&0xff, v11, r2v.v189)
+		mid := round1Mid(tmpl.ctx, tbl, &st, sample, &regs)
+		r2 := round1Tail(tmpl.ctx, tbl, &st, mid.rax, mid.r13&0xff, mid.r15&0xff, mid.r8&0xff, mid.r14&0xff)
+		r2v := round2Sub6400(tmpl.ctx, tbl, &st, r2.rdi, r2.rsi, r2.rdx, r2.rcx, r2.r8, r2.r9, r2.rax, r2.rbx, r2.r10, r2.r11, r2.r13, r2.r14, r2.r15, 0)
+		r8p := r2v.cp12[2] ^ tmpl.c5b8 ^ r2v.cp12[1]
+		v6 := t4(tbl, 0x46a0, st[0x390]^0x2b) ^ tmpl.c5f0 ^ t4(tbl, 0x4ac0, (r8p>>24)^0x29) ^ t4(tbl, 0x2ff0, (st[0x298]>>16)^0xd6)
+		v9 := t4(tbl, 0x4ac0, r2v.cp12[0]) ^ tmpl.c540 ^ t4(tbl, 0x2ff0, (r2v.v171>>16)^0x69)
+		v11 := t4(tbl, 0x3950, st[0x298]^0x57) ^ tmpl.c538 ^ t4(tbl, 0x46a0, (r8p>>8)^0x2f)
+		r3 := round3Sub8000(tmpl.ctx, tbl, &st, st[0x270], r2v.v189, r8p&0xff, (r8p>>16)&0xffff, st[0x280], v6, (r8p>>16)&0xff, v9, r2v.v187&0xff, v11, r2v.v189)
 		base := r3.pt[0].offset
 		for _, pair := range r3.pt {
 			if pair.offset < base {
@@ -142,5 +179,6 @@ func decryptSample(tmpl *template, sample []byte) []byte {
 		st[0x108] = st[0x180]
 		st[0x220] += 0x10
 	}
+	ws.out = out
 	return out
 }
