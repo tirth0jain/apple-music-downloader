@@ -243,6 +243,9 @@ func MuxStandardM4A(init *mp4.InitSegment, samples []mp4.FullSample, w io.Writer
 	moov := &mp4.MoovBox{}
 	moov.AddChild(mvhd)
 	moov.AddChild(track)
+	if err := installTagMetadata(moov); err != nil {
+		return err
+	}
 
 	var moovBuf bytes.Buffer
 	if err := moov.Encode(&moovBuf); err != nil {
@@ -284,5 +287,28 @@ func MuxStandardM4A(init *mp4.InitSegment, samples []mp4.FullSample, w io.Writer
 			return err
 		}
 	}
+	return nil
+}
+
+// installTagMetadata adds the empty moov.udta.meta.ilst container that
+// go-mp4tag (the tagger amdl runs after the mux: writeMP4Tags) requires before
+// it will touch a file. Without it every ALAC rip logs "moov.udta box not
+// present" and ships untagged — the box used to be created by an MP4Box pass,
+// which cannot run on the seedbox. Upstream gets it from its DefragmentMP4
+// pass; this muxer writes a progressive file itself, so it installs the boxes
+// here instead — which also avoids a second full-file rewrite of a 50-200 MB
+// hi-res track just to add an empty box.
+func installTagMetadata(moov *mp4.MoovBox) error {
+	hdlr, err := mp4.CreateHdlr("mdir")
+	if err != nil {
+		return err
+	}
+	// meta must be the ISO form (4-byte version/flags); go-mp4tag rejects the
+	// QuickTime variant that udta usually carries inside Apple files.
+	meta := mp4.CreateMetaBox(0, hdlr)
+	meta.AddChild(&mp4.IlstBox{})
+	udta := &mp4.UdtaBox{}
+	udta.AddChild(meta)
+	moov.AddChild(udta)
 	return nil
 }

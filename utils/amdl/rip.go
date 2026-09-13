@@ -2,6 +2,7 @@ package amdl
 
 import (
 	"fmt"
+	defrag "main/internal/media/defrag"
 	"main/utils/alacfix"
 	"main/utils/ampapi"
 	"main/utils/lyrics"
@@ -242,34 +243,34 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		phase.Since(ph0, "v4_run_done")
 
 	}
-	//这里利用MP4box将fmp4转化为mp4，并添加ilst box与cover，方便后面的mp4tag添加更多自定义标签
-	tags := []string{
-		"tool=",
-		"artist=AppleMusic",
+	// 将 fMP4 解碎片为普通 MP4（ftyp 改为 tagger 认得的 "M4A "，并建好空的
+	// moov.udta.meta.ilst），元数据与封面统一在后面的 writeMP4Tags 写入。
+	// 这一步取代了原来的 MP4Box -itags：seedbox 上没有 MP4Box（无 root，
+	// Debian 12 也没有 gpac），而 go-mp4tag 需要的正是 MP4Box 当年建的那个
+	// ilst box，所以缺了它每个 AAC rip 都会报 "unsupported ftyp: 69736f35"
+	// 加 "MP4Box unavailable"。
+	//
+	// runv5（AAC）交给我们的就是 fMP4（DecryptMP4 原样写 init + 每个 moof/mdat），
+	// defrag 一次搞定；我们自己写的 ALAC muxer（runv4.MuxStandardM4A）输出的
+	// 已经是 progressive 的 ftyp+moov+mdat，defrag 会回 "input is not a
+	// fragmented MP4" —— 那是预期内的 no-op，因为那个 muxer 自己会建好这些 box。
+	if err := defrag.DefragmentMP4(trackPath); err != nil && !strings.Contains(err.Error(), "not a fragmented MP4") {
+		// 标签问题绝不能让一首歌失败：rip.sh 会用路径里的信息给 FLAC 重新打标签
+		// （AAC 走 stream copy 也一样），所以这里只警告。
+		fmt.Printf("\u26A0 MP4 defragment failed (tags may be missing): %v\n", err)
 	}
+
+	// 封面（来自 amp-api 的 artworkURL）现在由 writeMP4Tags 嵌入，文件只为这一次
+	// 写入而存在，写完就删。
+	removeCoverAfterWrite := false
 	if Config.EmbedCover {
 		if (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
 			track.CoverPath, err = writeCover(track.SaveDir, track.ID, track.Resp.Attributes.Artwork.URL)
 			if err != nil {
 				fmt.Println("Failed to write cover.")
+			} else {
+				removeCoverAfterWrite = true
 			}
-		}
-		tags = append(tags, fmt.Sprintf("cover=%s", track.CoverPath))
-	}
-	tagsString := strings.Join(tags, ":")
-	cmd := exec.Command("MP4Box", "-itags", tagsString, trackPath)
-	if err := cmd.Run(); err != nil {
-		// MP4Box is OPTIONAL here: it only adds ilst tags to the intermediate
-		// m4a. Our seedbox pipeline re-encodes to FLAC and re-tags with
-		// metaflac (rip.sh), so a missing/unusable MP4Box must not fail the
-		// track — keep the downloaded file and continue.
-		fmt.Printf("Embed skipped (MP4Box unavailable or failed): %v\n", err)
-	}
-	if (strings.Contains(track.PreID, "pl.") || strings.Contains(track.PreID, "ra.")) && Config.DlAlbumcoverForPlaylist {
-		if err := os.Remove(track.CoverPath); err != nil {
-			fmt.Printf("Error deleting file: %s\n", track.CoverPath)
-			counter.Error++
-			return
 		}
 	}
 	track.SavePath = trackPath
@@ -284,6 +285,13 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	}
 
 	err = writeMP4Tags(track, lrc)
+	if removeCoverAfterWrite && track.CoverPath != "" {
+		if rmErr := os.Remove(track.CoverPath); rmErr != nil {
+			fmt.Printf("Error deleting file: %s\n", track.CoverPath)
+			counter.Error++
+			return
+		}
+	}
 	if err != nil {
 		fmt.Println("\u26A0 Failed to write tags in media:", err)
 		counter.Unavailable++
@@ -461,23 +469,12 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 			counter.Error++
 			return err
 		}
-		tags := []string{
-			"tool=",
-			"disk=1/1",
-			"track=1",
-			"tracknum=1/1",
-			fmt.Sprintf("artist=%s", "Apple Music Station"),
-			fmt.Sprintf("performer=%s", "Apple Music Station"),
-			fmt.Sprintf("album_artist=%s", "Apple Music Station"),
-			fmt.Sprintf("album=%s", station.Name),
-			fmt.Sprintf("title=%s", station.Name),
+		// 与单曲路径同样的纯 Go 替代：电台流也是 fMP4，先解碎片，再用
+		// go-mp4tag 写电台元数据和封面（MP4Box 在这台机器上根本不存在）。
+		if err := defrag.DefragmentMP4(trackPath); err != nil && !strings.Contains(err.Error(), "not a fragmented MP4") {
+			fmt.Printf("\u26A0 MP4 defragment failed (tags may be missing): %v\n", err)
 		}
-		if Config.EmbedCover {
-			tags = append(tags, fmt.Sprintf("cover=%s", station.CoverPath))
-		}
-		tagsString := strings.Join(tags, ":")
-		cmd := exec.Command("MP4Box", "-itags", tagsString, trackPath)
-		if err := cmd.Run(); err != nil {
+		if err := writeStationTags(trackPath, station.Name, station.CoverPath); err != nil {
 			fmt.Printf("Embed failed: %v\n", err)
 		}
 		AddedTracks = append(AddedTracks, AddedTrack{

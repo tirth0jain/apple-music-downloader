@@ -150,6 +150,17 @@ func writeMP4Tags(track *task.Track, lrc string) error {
 		Album:       track.Resp.Attributes.AlbumName,
 	}
 
+	if Config.EmbedCover && track.CoverPath != "" {
+		cover, err := os.ReadFile(track.CoverPath)
+		if err != nil {
+			return fmt.Errorf("read cover: %w", err)
+		}
+		t.Pictures = []*mp4tag.MP4Picture{{
+			Format: mp4tag.ImageTypeAuto,
+			Data:   cover,
+		}}
+	}
+
 	if Config.TagSortOrder {
 		t.TitleSort = track.Resp.Attributes.Name
 		t.ArtistSort = track.Resp.Attributes.ArtistName
@@ -229,6 +240,44 @@ func writeMP4Tags(track *task.Track, lrc string) error {
 		return err
 	}
 	return nil
+}
+
+// writeStationTags writes the radio-station metadata the old MP4Box "-itags"
+// pass used to add (disk/track/tracknum/artist/performer/album_artist/album/
+// title) plus the station cover. go-mp4tag replaces that pass everywhere now:
+// MP4Box is not installed on the seedbox and never will be.
+func writeStationTags(path, name, coverPath string) error {
+	t := &mp4tag.MP4Tags{
+		Title:       name,
+		Artist:      "Apple Music Station",
+		Album:       name,
+		AlbumArtist: "Apple Music Station",
+		TrackNumber: 1,
+		TrackTotal:  1,
+		DiscNumber:  1,
+		DiscTotal:   1,
+		Custom: map[string]string{
+			"PERFORMER": "Apple Music Station",
+		},
+	}
+
+	if Config.EmbedCover && coverPath != "" {
+		cover, err := os.ReadFile(coverPath)
+		if err != nil {
+			return fmt.Errorf("read cover: %w", err)
+		}
+		t.Pictures = []*mp4tag.MP4Picture{{
+			Format: mp4tag.ImageTypeAuto,
+			Data:   cover,
+		}}
+	}
+
+	mp4, err := mp4tag.Open(path)
+	if err != nil {
+		return err
+	}
+	defer mp4.Close()
+	return mp4.Write(t, []string{})
 }
 
 func extractMvAudio(c string) (string, error) {
@@ -512,10 +561,10 @@ func extractMedia(b string, more_mode bool) (string, string, error) {
 	var Quality string
 	// Lowest-variant fallback for when caps exclude every ALAC variant.
 	var (
-		fallbackURL    *url.URL
-		fallbackRate   int
-		fallbackDepth  int
-		fallbackLabel  string
+		fallbackURL   *url.URL
+		fallbackRate  int
+		fallbackDepth int
+		fallbackLabel string
 	)
 	for _, variant := range master.Variants {
 		if dl_atmos {
