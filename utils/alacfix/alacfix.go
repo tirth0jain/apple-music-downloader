@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/bits"
 	"os"
 )
 
@@ -25,6 +26,16 @@ import (
 // Tracks that use any other codec (AAC, FLAC, etc.) are silently skipped.
 
 // ---------- Bit reader ------------------------------------------------------
+//
+// The scanner below is a full entropy decode of every packet (see
+// scanOneElement/riceDecompress), so the bit reader is the hot loop: a whole
+// track is ~2.7s of wall time with the original bit-at-a-time reader. These
+// methods keep the exact same semantics but take the common case — at least 8
+// bytes left in the packet, reads of 32 bits or fewer — from a single 64-bit
+// big-endian window. The bit-at-a-time loops survive as *Slow fallbacks for
+// the last few bytes of a packet and for the odd n<=0 calls the rice decoder
+// can make (decodeScalar with k<=0), where the legacy behaviour (skip(-1)
+// moving pos back, read(-1) leaving pos alone) is reproduced bit for bit.
 
 type bitReader struct {
 	buf   []byte
@@ -40,7 +51,33 @@ func newBitReader(buf []byte) *bitReader {
 
 func (b *bitReader) left() int { return b.nbits - b.pos }
 
+// window returns the 64 bits starting at the byte holding b.pos, and whether
+// that many bytes are actually present in the packet.
+func (b *bitReader) window() (uint64, int, bool) {
+	i := b.pos >> 3
+	if i+8 <= len(b.buf) {
+		return binary.BigEndian.Uint64(b.buf[i:]), int(b.pos & 7), true
+	}
+	return 0, 0, false
+}
+
 func (b *bitReader) read(n int) (uint32, error) {
+	if n <= 0 || n > 32 {
+		return b.readSlow(n)
+	}
+	if b.pos+n > b.nbits {
+		return 0, errEOF
+	}
+	if w, off, ok := b.window(); ok {
+		b.pos += n
+		return uint32((w << uint(off)) >> uint(64-n)), nil
+	}
+	return b.readSlow(n)
+}
+
+// readSlow is the original bit-at-a-time reader, kept for the packet tail and
+// for n outside (0, 32].
+func (b *bitReader) readSlow(n int) (uint32, error) {
 	if n == 0 {
 		return 0, nil
 	}
@@ -58,8 +95,20 @@ func (b *bitReader) read(n int) (uint32, error) {
 }
 
 func (b *bitReader) show(n int) (uint32, error) {
+	if n <= 0 || n > 32 {
+		save := b.pos
+		v, err := b.readSlow(n)
+		b.pos = save
+		return v, err
+	}
+	if b.pos+n > b.nbits {
+		return 0, errEOF
+	}
+	if w, off, ok := b.window(); ok {
+		return uint32((w << uint(off)) >> uint(64-n)), nil
+	}
 	save := b.pos
-	v, err := b.read(n)
+	v, err := b.readSlow(n)
 	b.pos = save
 	return v, err
 }
@@ -83,7 +132,41 @@ func (b *bitReader) readSigned(n int) (int32, error) {
 	return int32(v), nil
 }
 
+// unary09 counts the leading 1 bits before the first 0, capped at 9.
+// The original read one bit at a time, so a run that reaches the end of the
+// packet without a terminating 0 is an EOF error; a run of 9 ones is not
+// (it returns 9 having consumed exactly 9 bits, no terminator).
 func (b *bitReader) unary09() (uint32, error) {
+	if w, off, ok := b.window(); ok {
+		avail := b.nbits - b.pos
+		n := 64 - off // bits the window can supply from b.pos
+		if avail < n {
+			n = avail
+		}
+		if n > 9 {
+			n = 9
+		}
+		// Shift the bit position to the top of the window BEFORE counting:
+		// LeadingZeros64 looks at the most significant bits, and b.pos is
+		// usually not byte-aligned.
+		ones := bits.LeadingZeros64(^(w << uint(off)))
+		if ones >= n {
+			if n < 9 {
+				return 0, errEOF
+			}
+			b.pos += 9
+			return 9, nil
+		}
+		b.pos += ones + 1
+		return uint32(ones), nil
+	}
+	return b.unary09Slow()
+}
+
+// unary09Slow is the original bit-at-a-time loop, kept for the last few bytes
+// of a packet (where no 64-bit window is available) and split out so the fast
+// path above stays small enough to inline.
+func (b *bitReader) unary09Slow() (uint32, error) {
 	cnt := uint32(0)
 	for cnt < 9 {
 		v, err := b.read(1)
@@ -102,12 +185,7 @@ func avLog2(x uint32) int {
 	if x == 0 {
 		return 0
 	}
-	r := 0
-	for x > 1 {
-		x >>= 1
-		r++
-	}
-	return r
+	return bits.Len32(x) - 1
 }
 
 // ---------- ALAC element body scanner --------------------------------------
@@ -131,20 +209,22 @@ func decodeScalar(br *bitReader, k int, bps int) (uint32, error) {
 		return br.read(bps)
 	}
 	if k != 1 {
-		extrabits, err := br.show(k)
+		// One read instead of show(k)+skip(k): the same bits are consumed and
+		// the error behaviour is identical (both need k bits available), but
+		// the common branch (extrabits > 1) no longer peeks and then skips.
+		// The else branch hands the last bit back — the legacy code consumed
+		// k-1 there. k is never negative (k = log2(history>>9 + 3) capped at
+		// k >= 0), and k == 0 lands in read()'s n <= 0 path, exactly as the
+		// legacy show(0)/skip(-1) pair did.
+		extrabits, err := br.read(k)
 		if err != nil {
 			return 0, err
 		}
 		x = (x << uint(k)) - x
 		if extrabits > 1 {
 			x += extrabits - 1
-			if err := br.skip(k); err != nil {
-				return 0, err
-			}
-		} else {
-			if err := br.skip(k - 1); err != nil {
-				return 0, err
-			}
+		} else if err := br.skip(-1); err != nil {
+			return 0, err
 		}
 	}
 	return x, nil
@@ -265,7 +345,9 @@ func scanOneElement(br *bitReader, p *alacParams) (int, bool, error) {
 		if _, err := br.read(8); err != nil { // decorr_left_weight
 			return 0, false, err
 		}
-		rhms := make([]uint32, channels)
+		// channels is 1 (SCE/TYPE_CCE) or 2 (CPE) — a fixed array keeps this
+		// per-packet allocation out of the hot loop.
+		var rhms [2]uint32
 		for c := 0; c < channels; c++ {
 			if _, err := br.read(4); err != nil { // pred_type
 				return 0, false, err
