@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -527,15 +528,37 @@ func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
 	var outBuf *bufio.Writer
 	MaxMemorySize := int64(Config.MaxMemoryLimit * 1024 * 1024)
 	inBuf := bufio.NewReader(in)
+
+	// The deliverable is written to a temp file in the SAME directory and only
+	// renamed over `outfile` once the whole decrypt + mux has succeeded.
+	//
+	// This is not cosmetic. Above max-memory-limit — every hi-res track now
+	// that the limit is 64 MB — the output is streamed straight to disk as it
+	// is decrypted, so a run that dies mid-file (dropped range, wrapper 502,
+	// the rip's own timeout, the watchdog) used to leave a TRUNCATED .m4a
+	// sitting at the real deliverable path, indistinguishable from a finished
+	// track to anything that globs *.m4a: the torrent builder, the FLAC
+	// transcode, the album's per-track finalize. A file that never reaches its
+	// final name cannot be mistaken for a track. The buffered path had the
+	// same hole in miniature (os.Create, then a failed Write), so both paths
+	// now commit through the rename.
+	cleanStaleParts(filepath.Dir(outfile))
+	pfh, err := os.CreateTemp(filepath.Dir(outfile), ".amdl-part-*")
+	if err != nil {
+		return err
+	}
+	partPath := pfh.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			pfh.Close()
+			os.Remove(partPath)
+		}
+	}()
 	if totalLen <= MaxMemorySize {
 		outBuf = bufio.NewWriter(&buffer)
 	} else {
-		ofh, err := os.Create(outfile)
-		if err != nil {
-			return err
-		}
-		defer ofh.Close()
-		outBuf = bufio.NewWriter(ofh)
+		outBuf = bufio.NewWriter(pfh)
 	}
 	init, offset, err := ReadInitSegment(inBuf)
 	if err != nil {
@@ -768,19 +791,48 @@ func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
 		return err
 	}
 	if totalLen <= MaxMemorySize {
-		// create output file
-		ofh, err := os.Create(outfile)
-		if err != nil {
-			return err
-		}
-		defer ofh.Close()
-
-		_, err = ofh.Write(buffer.Bytes())
-		if err != nil {
+		// Buffered mode: the muxed bytes are in `buffer`; write them into the
+		// same temp file the streaming path would have used.
+		if _, err = pfh.Write(buffer.Bytes()); err != nil {
 			return err
 		}
 	}
+	// Publish the finished file. CreateTemp makes it 0600; os.Create used to
+	// leave 0644 (0666 masked) and the webseed/torrent reader is a different
+	// process, so restore the mode before the rename.
+	if err = pfh.Chmod(0o644); err != nil {
+		return err
+	}
+	if err = pfh.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(partPath, outfile); err != nil {
+		return err
+	}
+	committed = true
 	return nil
+}
+
+// cleanStaleParts removes aborted .amdl-part-* temp files left in dir by an
+// earlier run that was killed outright: SIGKILL/SIGTERM (the rip timeout and the
+// wrapper watchdog both use them) skip the deferred cleanup, so without this the
+// parts accumulate one per killed attempt. The age guard is what keeps it safe:
+// only temps untouched for over an hour are removed, so a concurrent amdl
+// writing into the same directory can never lose its in-progress file.
+func cleanStaleParts(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-time.Hour)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), ".amdl-part-") {
+			continue
+		}
+		if info, err := e.Info(); err == nil && info.ModTime().Before(cutoff) {
+			os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
 }
 
 // Remove boxes in the init segment that are known to cause compatibility issues
