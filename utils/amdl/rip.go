@@ -259,6 +259,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		// （AAC 走 stream copy 也一样），所以这里只警告。
 		fmt.Printf("\u26A0 MP4 defragment failed (tags may be missing): %v\n", err)
 	}
+	phase.Since(ph0, "post_defrag")
 
 	// 封面（来自 amp-api 的 artworkURL）现在由 writeMP4Tags 嵌入，文件只为这一次
 	// 写入而存在，写完就删。
@@ -284,6 +285,8 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		}
 	}
 
+	phase.Since(ph0, "post_alacfix")
+
 	err = writeMP4Tags(track, lrc)
 	if removeCoverAfterWrite && track.CoverPath != "" {
 		if rmErr := os.Remove(track.CoverPath); rmErr != nil {
@@ -297,6 +300,8 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		counter.Unavailable++
 		return
 	}
+
+	phase.Since(ph0, "post_tags")
 
 	// CONVERSION FEATURE hook
 	convertIfNeeded(track)
@@ -315,6 +320,7 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 
 	counter.Success++
 	okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
+	phase.Since(ph0, "track_done")
 }
 
 func ripStation(albumId string, token string, storefront string, mediaUserToken string) error {

@@ -567,6 +567,7 @@ func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
 	if init == nil {
 		return errors.New("no init segment found")
 	}
+	phDec := phase.Start()
 
 	// DecryptInit mutates the init (strips sinf/pssh) — call it exactly once
 	// and derive the track map from that single result.
@@ -657,7 +658,10 @@ func downloadAndDecryptFile(liteServer string, in io.Reader, outfile string,
 			case res, ok := <-results:
 				if !ok {
 					// results 通道已关闭，说明所有解密完成；re-mux 并写出
-					return muxFragments(init, samples, outBuf)
+					phase.Since(phDec, "dec_workers_done")
+					err := muxFragments(init, samples, outBuf)
+					phase.Since(phDec, "mux_done")
+					return err
 				}
 
 				// 将乱序到达的结果放入缓冲区
